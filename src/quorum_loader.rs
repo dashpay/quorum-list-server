@@ -37,29 +37,40 @@ pub async fn load_initial_quorums(
                             if let Some(info_obj) = quorum_info.as_object() {
                                 let quorum_hash_bytes = hex::decode(quorum_hash_str)?;
                                 if quorum_hash_bytes.len() == 32 {
-                                    // Use minimal data from listextended - just hash and a placeholder key
-                                    let creation_height = info_obj.get("creationHeight")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
-                                    let valid_members_count = info_obj.get("numValidMembers")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
+                                    // Get the actual quorum public key via quorum info
+                                    let info_result: serde_json::Value = client.call("quorum", &[
+                                        serde_json::json!("info"), 
+                                        serde_json::json!(6), // llmq_25_67 = type 6
+                                        serde_json::json!(quorum_hash_str)
+                                    ])?;
                                     
-                                    // Create a placeholder 48-byte key
-                                    let placeholder_key = vec![0u8; 48];
-                                    
-                                    let entry = QuorumListEntry::new_extended(
-                                        quorum_hash_bytes,
-                                        placeholder_key,
-                                        creation_height,
-                                        Vec::new(), // No members data
-                                        String::new(), // No threshold signature
-                                        0, // No mining members count
-                                        valid_members_count,
-                                    );
-                                    quorum_list.add_entry(entry);
-                                    println!("Loaded quorum: {} at height {} with {} members", 
-                                        quorum_hash_str, creation_height, valid_members_count);
+                                    if let Some(detailed_info) = info_result.as_object() {
+                                        if let Some(pubkey_str) = detailed_info.get("quorumPublicKey").and_then(|v| v.as_str()) {
+                                            let public_key = hex::decode(pubkey_str)?;
+                                            
+                                            if public_key.len() == 48 {
+                                                let creation_height = info_obj.get("creationHeight")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0) as u32;
+                                                let valid_members_count = info_obj.get("numValidMembers")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0) as u32;
+                                                
+                                                let entry = QuorumListEntry::new_extended(
+                                                    quorum_hash_bytes,
+                                                    public_key,
+                                                    creation_height,
+                                                    Vec::new(), // No members data needed
+                                                    String::new(), // No threshold signature needed
+                                                    0, // No mining members count needed
+                                                    valid_members_count,
+                                                );
+                                                quorum_list.add_entry(entry);
+                                                println!("Loaded quorum: {} at height {} with {} members", 
+                                                    quorum_hash_str, creation_height, valid_members_count);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -110,29 +121,42 @@ pub async fn load_quorums_at_height(
                             if let Some(info_obj) = quorum_info.as_object() {
                                 let quorum_hash_bytes = hex::decode(quorum_hash_str)?;
                                 if quorum_hash_bytes.len() == 32 {
-                                    // Use minimal data from listextended - just hash and a placeholder key
-                                    let creation_height = info_obj.get("creationHeight")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
-                                    let valid_members_count = info_obj.get("numValidMembers")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
+                                    // Get the actual quorum public key via quorum info at specific height
+                                    let info_result: serde_json::Value = client.call("quorum", &[
+                                        serde_json::json!("info"), 
+                                        serde_json::json!(6), // llmq_25_67 = type 6
+                                        serde_json::json!(quorum_hash_str),
+                                        serde_json::json!(true), // includeSkShare
+                                        serde_json::json!(height) // at specific height
+                                    ])?;
                                     
-                                    // Create a placeholder 48-byte key
-                                    let placeholder_key = vec![0u8; 48];
-                                    
-                                    let entry = QuorumListEntry::new_extended(
-                                        quorum_hash_bytes,
-                                        placeholder_key,
-                                        creation_height,
-                                        Vec::new(), // No members data
-                                        String::new(), // No threshold signature
-                                        0, // No mining members count
-                                        valid_members_count,
-                                    );
-                                    quorum_list.add_entry(entry);
-                                    println!("Loaded quorum at height {}: {} with {} members", 
-                                        height, quorum_hash_str, valid_members_count);
+                                    if let Some(detailed_info) = info_result.as_object() {
+                                        if let Some(pubkey_str) = detailed_info.get("quorumPublicKey").and_then(|v| v.as_str()) {
+                                            let public_key = hex::decode(pubkey_str)?;
+                                            
+                                            if public_key.len() == 48 {
+                                                let creation_height = info_obj.get("creationHeight")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0) as u32;
+                                                let valid_members_count = info_obj.get("numValidMembers")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0) as u32;
+                                                
+                                                let entry = QuorumListEntry::new_extended(
+                                                    quorum_hash_bytes,
+                                                    public_key,
+                                                    creation_height,
+                                                    Vec::new(), // No members data needed
+                                                    String::new(), // No threshold signature needed
+                                                    0, // No mining members count needed
+                                                    valid_members_count,
+                                                );
+                                                quorum_list.add_entry(entry);
+                                                println!("Loaded quorum at height {}: {} with {} members", 
+                                                    height, quorum_hash_str, valid_members_count);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
