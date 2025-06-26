@@ -38,11 +38,13 @@ pub async fn load_initial_quorums(
                                 let quorum_hash_bytes = hex::decode(quorum_hash_str)?;
                                 if quorum_hash_bytes.len() == 32 {
                                     // Get the actual quorum public key via quorum info
-                                    let info_result: serde_json::Value = client.call("quorum", &[
+                                    let rpc_params = [
                                         serde_json::json!("info"), 
                                         serde_json::json!(6), // llmq_25_67 = type 6
                                         serde_json::json!(quorum_hash_str)
-                                    ])?;
+                                    ];
+                                    println!("DEBUG: Calling quorum with params: {:?}", rpc_params);
+                                    let info_result: serde_json::Value = client.call("quorum", &rpc_params)?;
                                     
                                     if let Some(detailed_info) = info_result.as_object() {
                                         if let Some(pubkey_str) = detailed_info.get("quorumPublicKey").and_then(|v| v.as_str()) {
@@ -121,14 +123,15 @@ pub async fn load_quorums_at_height(
                             if let Some(info_obj) = quorum_info.as_object() {
                                 let quorum_hash_bytes = hex::decode(quorum_hash_str)?;
                                 if quorum_hash_bytes.len() == 32 {
-                                    // Get the actual quorum public key via quorum info at specific height
-                                    let info_result: serde_json::Value = client.call("quorum", &[
+                                    // Get the actual quorum public key via quorum info
+                                    let rpc_params = [
                                         serde_json::json!("info"), 
                                         serde_json::json!(6), // llmq_25_67 = type 6
                                         serde_json::json!(quorum_hash_str),
-                                        serde_json::json!(true), // includeSkShare
-                                        serde_json::json!(height) // at specific height
-                                    ])?;
+                                        serde_json::json!(true) // includeSkShare
+                                    ];
+                                    println!("DEBUG: Calling quorum with params: {:?}", rpc_params);
+                                    let info_result: serde_json::Value = client.call("quorum", &rpc_params)?;
                                     
                                     if let Some(detailed_info) = info_result.as_object() {
                                         if let Some(pubkey_str) = detailed_info.get("quorumPublicKey").and_then(|v| v.as_str()) {
