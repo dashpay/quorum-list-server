@@ -114,14 +114,29 @@ async fn health_check() -> Json<ApiResponse<String>> {
 }
 
 async fn get_all_quorums(
-    State((shared_list, _)): State<(SharedQuorumList, SharedConfig)>,
+    State((shared_list, config)): State<(SharedQuorumList, SharedConfig)>,
 ) -> Result<Json<ApiResponse<Vec<QuorumEntryResponse>>>, StatusCode> {
-    match shared_list.read() {
-        Ok(list) => {
-            let quorums: Vec<QuorumEntryResponse> = list.iter().map(|entry| entry.into()).collect();
-            Ok(Json(ApiResponse::success(quorums)))
+    // Fetch fresh quorums from Dash Core
+    match crate::quorum_loader::load_initial_quorums(&config).await {
+        Ok(new_quorums) => {
+            // Update the shared list with fresh data
+            match shared_list.write() {
+                Ok(mut list) => {
+                    *list = new_quorums;
+                }
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+            
+            // Now read and return the updated list
+            match shared_list.read() {
+                Ok(list) => {
+                    let quorums: Vec<QuorumEntryResponse> = list.iter().map(|entry| entry.into()).collect();
+                    Ok(Json(ApiResponse::success(quorums)))
+                }
+                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load quorums: {}", e))))
     }
 }
 
