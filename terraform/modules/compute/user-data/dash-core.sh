@@ -12,7 +12,7 @@ apt-get install -y curl wget software-properties-common
 useradd -m -s /bin/bash dash
 
 # Download and install Dash Core
-DASH_VERSION="20.1.1"
+DASH_VERSION="22.1.2"
 cd /tmp
 wget https://github.com/dashpay/dash/releases/download/v${DASH_VERSION}/dashcore-${DASH_VERSION}-x86_64-linux-gnu.tar.gz
 tar -xzf dashcore-${DASH_VERSION}-x86_64-linux-gnu.tar.gz
