@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::quorum_list::{QuorumList, QuorumListEntry};
+use crate::masternode::EvoMasternodeList;
+use crate::masternode_cache::MasternodeCache;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -13,6 +15,7 @@ use tower_http::cors::CorsLayer;
 
 pub type SharedQuorumList = Arc<RwLock<QuorumList>>;
 pub type SharedConfig = Arc<Config>;
+pub type SharedMasternodeCache = Arc<MasternodeCache>;
 
 #[derive(Serialize)]
 pub struct ApiResponse<T> {
@@ -96,7 +99,7 @@ impl From<&QuorumListEntry> for QuorumEntryResponse {
 }
 
 
-pub fn create_router(shared_list: SharedQuorumList, config: Config) -> Router {
+pub fn create_router(shared_list: SharedQuorumList, config: Config, masternode_cache: SharedMasternodeCache) -> Router {
     let shared_config = Arc::new(config);
     Router::new()
         .route("/health", get(health_check))
@@ -105,7 +108,8 @@ pub fn create_router(shared_list: SharedQuorumList, config: Config) -> Router {
         .route("/quorums/clear", post(clear_quorums))
         .route("/previous", get(get_previous_quorums))
         .route("/quorums/:hash", get(get_quorum_by_hash))
-        .with_state((shared_list, shared_config))
+        .route("/masternodes", get(get_masternodes))
+        .with_state((shared_list, shared_config, masternode_cache))
         .layer(CorsLayer::permissive())
 }
 
@@ -114,7 +118,7 @@ async fn health_check() -> Json<ApiResponse<String>> {
 }
 
 async fn get_all_quorums(
-    State((shared_list, config)): State<(SharedQuorumList, SharedConfig)>,
+    State((shared_list, config, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<Vec<QuorumEntryResponse>>>, StatusCode> {
     // Fetch fresh quorums from Dash Core
     match crate::quorum_loader::load_initial_quorums(&config).await {
@@ -141,7 +145,7 @@ async fn get_all_quorums(
 }
 
 async fn get_quorum_stats(
-    State((shared_list, _)): State<(SharedQuorumList, SharedConfig)>,
+    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumStats>>, StatusCode> {
     match shared_list.read() {
         Ok(list) => {
@@ -157,7 +161,7 @@ async fn get_quorum_stats(
 
 async fn get_quorum_by_hash(
     Path(hash): Path<String>,
-    State((shared_list, _)): State<(SharedQuorumList, SharedConfig)>,
+    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumEntryResponse>>, StatusCode> {
     let hash_bytes = match hex::decode(&hash) {
         Ok(bytes) if bytes.len() == 32 => bytes,
@@ -178,7 +182,7 @@ async fn get_quorum_by_hash(
 
 
 async fn clear_quorums(
-    State((shared_list, _)): State<(SharedQuorumList, SharedConfig)>,
+    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
     match shared_list.write() {
         Ok(mut list) => {
@@ -191,7 +195,7 @@ async fn clear_quorums(
 
 #[axum::debug_handler]
 async fn get_previous_quorums(
-    State((_, config)): State<(SharedQuorumList, SharedConfig)>,
+    State((_, config, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumsAtHeightResponse>>, StatusCode> {
     match crate::quorum_loader::get_current_block_height(&config).await {
         Ok(current_height) => {
@@ -211,6 +215,16 @@ async fn get_previous_quorums(
             }
         }
         Err(e) => Ok(Json(ApiResponse::error(format!("Failed to get block height: {}", e))))
+    }
+}
+
+#[axum::debug_handler]
+async fn get_masternodes(
+    State((_, _, masternode_cache)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+) -> Result<Json<ApiResponse<EvoMasternodeList>>, StatusCode> {
+    match masternode_cache.get_masternodes().await {
+        Ok(masternodes) => Ok(Json(ApiResponse::success(masternodes))),
+        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load masternodes: {}", e))))
     }
 }
 

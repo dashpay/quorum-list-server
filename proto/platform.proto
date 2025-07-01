@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package org.dash.platform.dapi.v0;
+
+// The Platform service definition
+service Platform {
+  // Get the status of the platform node
+  rpc getStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+// Request for getStatus
+message GetStatusRequest {
+  message GetStatusRequestV0 {}
+  
+  oneof version { 
+    GetStatusRequestV0 v0 = 1; 
+  }
+}
+
+// Response containing the status information
+message GetStatusResponse {
+  message GetStatusResponseV0 {
+    message Version {
+      message Software {
+        string dapi = 1;
+        optional string drive = 2;
+        optional string tenderdash = 3;
+      }
+
+      message Protocol {
+        message Tenderdash {
+          uint32 p2p = 1;
+          uint32 block = 2;
+        }
+
+        message Drive {
+          uint32 latest = 3;
+          uint32 current = 4;
+        }
+
+        Tenderdash tenderdash = 1;
+        Drive drive = 2;
+      }
+
+      Software software = 1;
+      Protocol protocol = 2;
+    }
+
+    message Time {
+      uint64 local = 1;
+      optional uint64 block = 2;
+      optional uint64 genesis = 3;
+      optional uint32 epoch = 4;
+    }
+
+    message Node {
+      bytes id = 1;
+      optional bytes pro_tx_hash = 2;
+    }
+
+    message Chain {
+      bool catching_up = 1;
+      bytes latest_block_hash = 2;
+      bytes latest_app_hash = 3;
+      uint64 latest_block_height = 4;
+      bytes earliest_block_hash = 5;
+      bytes earliest_app_hash = 6;
+      uint64 earliest_block_height = 7;
+      uint64 max_peer_block_height = 9;
+      optional uint32 core_chain_locked_height = 10;
+    }
+
+    message Network {
+      string chain_id = 1;
+      uint32 peers_count = 2;
+      bool listening = 3;
+    }
+
+    message StateSync {
+      uint64 total_synced_time = 1;
+      uint64 remaining_time = 2;
+      uint32 total_snapshots = 3;
+      optional uint64 chunk_process_avg_time = 4;
+      optional uint64 snapshot_height = 5;
+      optional uint64 snapshot_chunks_count = 6;
+      optional uint64 backfilled_blocks = 7;
+      optional uint64 backfill_blocks_total = 8;
+    }
+
+    Version version = 1;
+    Node node = 2;
+    Chain chain = 3;
+    Network network = 4;
+    StateSync state_sync = 5;
+    Time time = 6;
+  }
+
+  oneof version {
+    GetStatusResponseV0 v0 = 1;
+  }
+}

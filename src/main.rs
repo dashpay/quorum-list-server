@@ -2,10 +2,15 @@ mod api;
 mod config;
 mod quorum_list;
 mod quorum_loader;
+mod masternode;
+mod masternode_loader;
+mod masternode_cache;
+mod grpc_client;
 
 use api::SharedQuorumList;
 use config::Config;
 use quorum_list::QuorumList;
+use masternode_cache::MasternodeCache;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 
@@ -35,8 +40,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let shared_quorum_list: SharedQuorumList = Arc::new(RwLock::new(initial_quorums));
     
+    // Create masternode cache
+    let masternode_cache = Arc::new(MasternodeCache::new(config.clone()));
+    
+    // Start background refresh for masternode cache
+    masternode_cache.clone().start_background_refresh().await;
+    
     // Start the API server
-    let app = api::create_router(shared_quorum_list.clone(), config.clone());
+    let app = api::create_router(shared_quorum_list.clone(), config.clone(), masternode_cache.clone());
     let listener = TcpListener::bind(format!("{}:{}", config.server.host, config.server.port)).await?;
     
     println!("API Server starting on {}:{}", config.server.host, config.server.port);

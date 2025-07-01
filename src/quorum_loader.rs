@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::quorum_list::{QuorumList, QuorumListEntry, QuorumMember};
+use crate::quorum_list::{QuorumList, QuorumListEntry};
 use dashcore_rpc::{Client, RpcApi, Auth};
 use serde::Deserialize;
 use std::error::Error;
