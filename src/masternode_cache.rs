@@ -5,6 +5,7 @@ use crate::grpc_client;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use chrono::Local;
 
 pub struct MasternodeCache {
     data: Arc<RwLock<Option<EvoMasternodeList>>>,
@@ -72,21 +73,28 @@ impl MasternodeCache {
             async move {
                 // Skip POSE_BANNED nodes
                 if status == "POSE_BANNED" {
+                    println!("⏭️  Node {} at {} - skipping (POSE_BANNED)", idx, address);
                     return (idx, "fail".to_string(), None, None);
                 }
                 
                 // Parse address to get IP and port
                 let parts: Vec<&str> = address.split(':').collect();
                 if parts.len() != 2 {
+                    println!("❌ Node {} at {} - invalid address format", idx, address);
                     return (idx, "fail".to_string(), None, None);
                 }
                 
                 let ip = parts[0];
-                let port = 1443u16; // Platform gRPC port is always 1443
+                let port = self.config.get_dapi_port();
                 
-                // Check version with timeout
-                match grpc_client::check_node_version(ip, port).await {
-                    Ok(result) => {
+                println!("🔍 Node {} at {} - checking version...", idx, address);
+                
+                // Check version with additional timeout wrapper (3 seconds total)
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(3),
+                    grpc_client::check_node_version(ip, port)
+                ).await {
+                    Ok(Ok(result)) => {
                         if result.success {
                             println!("✓ Node {} at {} - version 2.0+ (DAPI: {:?}, Drive: {:?})", 
                                 idx, address, result.dapi_version, result.drive_version);
@@ -97,8 +105,12 @@ impl MasternodeCache {
                             (idx, "fail".to_string(), result.dapi_version, result.drive_version)
                         }
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         println!("✗ Node {} at {} - error: {}", idx, address, e);
+                        (idx, "fail".to_string(), None, None)
+                    },
+                    Err(_) => {
+                        println!("✗ Node {} at {} - timeout after 3 seconds", idx, address);
                         (idx, "fail".to_string(), None, None)
                     },
                 }
@@ -140,8 +152,11 @@ impl MasternodeCache {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(self.update_interval).await;
-                if let Err(e) = self.update_cache().await {
-                    eprintln!("Failed to update masternode cache: {}", e);
+                let now = Local::now();
+                println!("🔄 [{}] Background refresh: Starting masternode cache update...", now.format("%Y-%m-%d %H:%M:%S"));
+                match self.update_cache().await {
+                    Ok(_) => println!("✅ [{}] Background refresh: Masternode cache updated successfully", Local::now().format("%Y-%m-%d %H:%M:%S")),
+                    Err(e) => eprintln!("❌ [{}] Background refresh: Failed to update masternode cache: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), e),
                 }
             }
         });

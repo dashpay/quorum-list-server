@@ -27,10 +27,11 @@ pub async fn load_initial_quorums(
     
     let mut quorum_list = QuorumList::new();
     
-    // Parse the extended quorum list - extract llmq_25_67 quorums for testnet
+    // Parse the extended quorum list - extract the appropriate LLMQ type based on network
+    let llmq_type = config.get_llmq_type();
     if let Some(quorum_obj) = result.as_object() {
-        if let Some(llmq_25_67) = quorum_obj.get("llmq_25_67") {
-            if let Some(quorums_arr) = llmq_25_67.as_array() {
+        if let Some(llmq_quorums) = quorum_obj.get(llmq_type) {
+            if let Some(quorums_arr) = llmq_quorums.as_array() {
                 for quorum_item in quorums_arr {
                     if let Some(quorum_obj) = quorum_item.as_object() {
                         for (quorum_hash_str, quorum_info) in quorum_obj {
@@ -40,7 +41,7 @@ pub async fn load_initial_quorums(
                                     // Get the actual quorum public key via quorum info
                                     let rpc_params = [
                                         serde_json::json!("info"), 
-                                        serde_json::json!(6), // llmq_25_67 = type 6
+                                        serde_json::json!(config.get_llmq_type_id()),
                                         serde_json::json!(quorum_hash_str)
                                     ];
                                     println!("DEBUG: Calling quorum with params: {:?}", rpc_params);
@@ -113,10 +114,11 @@ pub async fn load_quorums_at_height(
     
     let mut quorum_list = QuorumList::new();
     
-    // Parse the extended quorum list - extract llmq_25_67 quorums for testnet
+    // Parse the extended quorum list - extract the appropriate LLMQ type based on network
+    let llmq_type = config.get_llmq_type();
     if let Some(quorum_obj) = result.as_object() {
-        if let Some(llmq_25_67) = quorum_obj.get("llmq_25_67") {
-            if let Some(quorums_arr) = llmq_25_67.as_array() {
+        if let Some(llmq_quorums) = quorum_obj.get(llmq_type) {
+            if let Some(quorums_arr) = llmq_quorums.as_array() {
                 for quorum_item in quorums_arr {
                     if let Some(quorum_obj) = quorum_item.as_object() {
                         for (quorum_hash_str, quorum_info) in quorum_obj {
@@ -126,7 +128,7 @@ pub async fn load_quorums_at_height(
                                     // Get the actual quorum public key via quorum info
                                     let rpc_params = [
                                         serde_json::json!("info"), 
-                                        serde_json::json!(6), // llmq_25_67 = type 6
+                                        serde_json::json!(config.get_llmq_type_id()),
                                         serde_json::json!(quorum_hash_str),
                                         serde_json::json!(true) // includeSkShare
                                     ];

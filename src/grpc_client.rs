@@ -27,7 +27,8 @@ pub async fn check_node_version(address: &str, port: u16) -> Result<VersionCheck
     
     let channel = Channel::from_shared(endpoint)?
         .tls_config(tls)?
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(2))
         .connect()
         .await?;
     
@@ -41,7 +42,7 @@ pub async fn check_node_version(address: &str, port: u16) -> Result<VersionCheck
     
     // Make the request with a timeout
     let response = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(2),
         client.get_status(request)
     ).await??;
     

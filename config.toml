@@ -9,3 +9,6 @@ password = "password"
 
 [quorum]
 previous_blocks_offset = 8
+
+[network]
+network = "testnet"
