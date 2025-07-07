@@ -7,6 +7,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub rpc: RpcConfig,
     pub quorum: QuorumConfig,
+    pub network: NetworkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +28,16 @@ pub struct QuorumConfig {
     pub previous_blocks_offset: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_network")]
+    pub network: String, // "mainnet" or "testnet"
+}
+
+fn default_network() -> String {
+    "testnet".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -41,6 +52,9 @@ impl Default for Config {
             },
             quorum: QuorumConfig {
                 previous_blocks_offset: 8,
+            },
+            network: NetworkConfig {
+                network: default_network(),
             },
         }
     }
@@ -90,6 +104,12 @@ impl Config {
             }
         }
 
+        if let Ok(network) = std::env::var("DASH_NETWORK") {
+            if network == "mainnet" || network == "testnet" {
+                config.network.network = network;
+            }
+        }
+
         config
     }
 
@@ -97,5 +117,26 @@ impl Config {
         let content = toml::to_string_pretty(self)?;
         fs::write(path, content)?;
         Ok(())
+    }
+
+    pub fn get_llmq_type(&self) -> &str {
+        match self.network.network.as_str() {
+            "mainnet" => "llmq_100_67",
+            _ => "llmq_25_67", // default to testnet
+        }
+    }
+
+    pub fn get_llmq_type_id(&self) -> u32 {
+        match self.network.network.as_str() {
+            "mainnet" => 4, // llmq_100_67 = type 4
+            _ => 6, // llmq_25_67 = type 6 (testnet)
+        }
+    }
+
+    pub fn get_dapi_port(&self) -> u16 {
+        match self.network.network.as_str() {
+            "mainnet" => 443,
+            _ => 1443, // default to testnet
+        }
     }
 }

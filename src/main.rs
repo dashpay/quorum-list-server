@@ -23,6 +23,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Configuration loaded:");
     println!("  Server: {}:{}", config.server.host, config.server.port);
     println!("  RPC: {} (user: {})", config.rpc.url, config.rpc.username);
+    println!("  Network: {}", config.network.network);
+    println!("  LLMQ Type: {} (ID: {})", config.get_llmq_type(), config.get_llmq_type_id());
+    println!("  DAPI Port: {}", config.get_dapi_port());
     println!("  Previous blocks offset: {}", config.quorum.previous_blocks_offset);
     
     // Load initial quorums from Dash Core
@@ -42,6 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create masternode cache
     let masternode_cache = Arc::new(MasternodeCache::new(config.clone()));
+    
+    // Populate masternode cache on startup
+    println!("Loading initial masternode list...");
+    match masternode_cache.get_masternodes().await {
+        Ok(masternodes) => {
+            println!("Successfully loaded {} masternodes into cache", masternodes.len());
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to load initial masternodes: {}. Cache will populate on first request.", e);
+        }
+    }
     
     // Start background refresh for masternode cache
     masternode_cache.clone().start_background_refresh().await;
