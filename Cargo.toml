@@ -5,8 +5,12 @@ edition = "2021"
 
 [dependencies]
 # dash-sdk = { git = "https://github.com/dashpay/platform", tag = "v1.8.0" }
-dashcore = { git = "https://github.com/dashpay/rust-dashcore", tag = "v0.39.6", default-features = false, features = ["std", "secp-recovery", "bincode"] }
-dashcore-rpc = { git = "https://github.com/dashpay/rust-dashcore", tag = "v0.39.6" }
+dashcore = { git = "https://github.com/dashpay/rust-dashcore", tag = "v0.40.0", default-features = false, features = [
+    "std",
+    "secp-recovery",
+    "bincode",
+] }
+dashcore-rpc = { git = "https://github.com/dashpay/rust-dashcore", tag = "v0.40.0" }
 crossbeam-channel = "0.5.13"
 futures = "0.3.31"
 serde = { version = "1.0.217", features = ["derive"] }

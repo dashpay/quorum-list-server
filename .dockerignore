@@ -1,0 +1,9 @@
+target
+debug
+.git
+.gitignore
+.vscode
+.idea
+terraform
+*.log
+**/*.rs.bk

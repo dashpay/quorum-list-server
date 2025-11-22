@@ -62,6 +62,31 @@ DASH_RPC_URL="http://192.168.1.100:19998" DASH_RPC_USER="myuser" cargo run
 API_PORT=8080 cargo run
 ```
 
+## Docker
+
+Build and run the containerized server (default port 3000 unless you mount a `config.toml`):
+
+```bash
+docker build -t quorum-list-server .
+
+docker run --rm -p 3000:3000 \
+  -e DASH_RPC_URL="http://192.168.1.100:19998" \
+  -e DASH_RPC_USER="dashrpc" \
+  -e DASH_RPC_PASSWORD="password" \
+  -e DASH_NETWORK="testnet" \
+  quorum-list-server
+```
+
+To use a custom configuration file instead of environment variables, mount it at `/app/config.toml`:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v $(pwd)/config.toml:/app/config.toml:ro \
+  quorum-list-server
+```
+
+The server reads `/app/config.toml` first; environment variables are only used when that file is absent.
+
 ## API Examples
 
 ```bash
