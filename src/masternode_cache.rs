@@ -151,7 +151,7 @@ impl MasternodeCache {
 
         // Update the version_check field and version info for each masternode
         for (idx, version_check, dapi_version, drive_version, elapsed) in results {
-            masternodes[idx].version_check = version_check.clone();
+            masternodes[idx].version_check = version_check;
             masternodes[idx].dapi_version = dapi_version;
             masternodes[idx].drive_version = drive_version;
 
