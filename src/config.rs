@@ -1,13 +1,87 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    Mainnet,
+    #[default]
+    Testnet,
+    Regtest,
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Network::Mainnet => write!(f, "mainnet"),
+            Network::Testnet => write!(f, "testnet"),
+            Network::Regtest => write!(f, "regtest"),
+        }
+    }
+}
+
+impl TryFrom<&str> for Network {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s.to_lowercase().as_str() {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            "regtest" => Ok(Network::Regtest),
+            _ => Err(format!(
+                "Invalid network '{}'. Must be one of: mainnet, testnet, regtest",
+                s
+            )),
+        }
+    }
+}
+
+impl Network {
+    pub fn llmq_type(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "llmq_100_67",
+            Network::Testnet => "llmq_25_67",
+            Network::Regtest => "llmq_test_platform",
+        }
+    }
+
+    pub fn llmq_type_id(&self) -> u32 {
+        match self {
+            Network::Mainnet => 4,   // llmq_100_67 = type 4
+            Network::Testnet => 6,   // llmq_25_67 = type 6
+            Network::Regtest => 106, // llmq_test_platform = type 106
+        }
+    }
+
+    pub fn dapi_port(&self) -> u16 {
+        match self {
+            Network::Mainnet => 443,
+            Network::Testnet => 1443,
+            Network::Regtest => 2443,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub rpc: RpcConfig,
     pub quorum: QuorumConfig,
-    pub network: NetworkConfig,
+    #[serde(default)]
+    pub network: Network,
+    #[serde(default)]
+    pub docker: DockerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DockerConfig {
+    /// Replace 127.0.0.1 in masternode addresses with this host.
+    /// Useful when running in Docker to reach host services.
+    /// Example: "host.docker.internal" for Docker Desktop
+    #[serde(default)]
+    pub localhost_replacement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,16 +102,6 @@ pub struct QuorumConfig {
     pub previous_blocks_offset: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkConfig {
-    #[serde(default = "default_network")]
-    pub network: String, // "mainnet" or "testnet"
-}
-
-fn default_network() -> String {
-    "testnet".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -53,15 +117,16 @@ impl Default for Config {
             quorum: QuorumConfig {
                 previous_blocks_offset: 8,
             },
-            network: NetworkConfig {
-                network: default_network(),
-            },
+            network: Network::default(),
+            docker: DockerConfig::default(),
         }
     }
 }
 
 impl Config {
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
@@ -75,7 +140,7 @@ impl Config {
 
         // Fall back to environment variables or defaults
         let mut config = Config::default();
-        
+
         if let Ok(port) = std::env::var("API_PORT") {
             if let Ok(port_num) = port.parse::<u16>() {
                 config.server.port = port_num;
@@ -104,39 +169,46 @@ impl Config {
             }
         }
 
-        if let Ok(network) = std::env::var("DASH_NETWORK") {
-            if network == "mainnet" || network == "testnet" {
-                config.network.network = network;
-            }
+        if let Ok(network_str) = std::env::var("DASH_NETWORK") {
+            config.network =
+                Network::try_from(network_str.as_str()).unwrap_or_else(|e| panic!("{}", e));
+        }
+
+        if let Ok(localhost_replacement) = std::env::var("LOCALHOST_REPLACEMENT") {
+            config.docker.localhost_replacement = Some(localhost_replacement);
         }
 
         config
     }
 
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn save_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let content = toml::to_string_pretty(self)?;
         fs::write(path, content)?;
         Ok(())
     }
 
-    pub fn get_llmq_type(&self) -> &str {
-        match self.network.network.as_str() {
-            "mainnet" => "llmq_100_67",
-            _ => "llmq_25_67", // default to testnet
-        }
+    pub fn get_llmq_type(&self) -> &'static str {
+        self.network.llmq_type()
     }
 
     pub fn get_llmq_type_id(&self) -> u32 {
-        match self.network.network.as_str() {
-            "mainnet" => 4, // llmq_100_67 = type 4
-            _ => 6, // llmq_25_67 = type 6 (testnet)
-        }
+        self.network.llmq_type_id()
     }
 
     pub fn get_dapi_port(&self) -> u16 {
-        match self.network.network.as_str() {
-            "mainnet" => 443,
-            _ => 1443, // default to testnet
+        self.network.dapi_port()
+    }
+
+    /// Replace 127.0.0.1 in an address with the configured replacement host.
+    /// Returns the original address if no replacement is configured.
+    pub fn replace_localhost(&self, address: &str) -> String {
+        if let Some(ref replacement) = self.docker.localhost_replacement {
+            address.replace("127.0.0.1", replacement)
+        } else {
+            address.to_string()
         }
     }
 }
