@@ -97,22 +97,23 @@ impl MasternodeCache {
                     return (idx, "fail".to_string(), None, None, start.elapsed());
                 }
 
-                // Parse address to get IP and port
-                let parts: Vec<&str> = address.split(':').collect();
+                // Parse address to get IP and port, applying localhost replacement if configured
+                let resolved_address = config.replace_localhost(&address);
+                let parts: Vec<&str> = resolved_address.split(':').collect();
                 if parts.len() != 2 {
                     println!("❌ Node {} at {} - invalid address format", idx, address);
                     return (idx, "fail".to_string(), None, None, start.elapsed());
                 }
 
-                let ip = parts[0];
+                let ip = parts[0].to_string();
                 let port = config.get_dapi_port();
 
-                println!("🔍 Node {} at {} - checking version...", idx, address);
+                println!("🔍 Node {} at {} (resolved: {}:{}) - checking version...", idx, address, ip, port);
 
                 // Check version with additional timeout wrapper (2 seconds total)
                 let result = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(2),
-                    grpc_client::check_node_version(ip, port)
+                    grpc_client::check_node_version(&ip, port)
                 ).await {
                     Ok(Ok(result)) => {
                         let elapsed = start.elapsed();

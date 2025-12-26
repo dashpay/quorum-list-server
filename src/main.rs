@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Configuration loaded:");
     println!("  Server: {}:{}", config.server.host, config.server.port);
     println!("  RPC: {} (user: {})", config.rpc.url, config.rpc.username);
-    println!("  Network: {}", config.network.network);
+    println!("  Network: {}", config.network);
     println!("  LLMQ Type: {} (ID: {})", config.get_llmq_type(), config.get_llmq_type_id());
     println!("  DAPI Port: {}", config.get_dapi_port());
     println!("  Previous blocks offset: {}", config.quorum.previous_blocks_offset);
