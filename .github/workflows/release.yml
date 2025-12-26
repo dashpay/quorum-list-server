@@ -49,7 +49,7 @@ jobs:
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Cache cargo
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -62,7 +62,7 @@ jobs:
 
     - name: Build and push Docker image by digest
       id: build
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: .
         platforms: ${{ matrix.platform }}
@@ -136,7 +136,7 @@ jobs:
         merge-multiple: true
 
     - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: ${{ runner.temp }}/binaries/*.tar.gz
         generate_release_notes: true
