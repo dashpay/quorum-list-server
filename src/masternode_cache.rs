@@ -1,11 +1,11 @@
 use crate::config::Config;
+use crate::grpc_client;
 use crate::masternode::EvoMasternodeList;
 use crate::masternode_loader;
-use crate::grpc_client;
+use chrono::Local;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use chrono::Local;
 
 pub struct MasternodeCache {
     data: Arc<RwLock<Option<EvoMasternodeList>>>,
@@ -24,7 +24,9 @@ impl MasternodeCache {
         }
     }
 
-    pub async fn get_masternodes(&self) -> Result<EvoMasternodeList, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_masternodes(
+        &self,
+    ) -> Result<EvoMasternodeList, Box<dyn std::error::Error + Send + Sync>> {
         // Check if we need to update the cache
         let should_update = {
             let last_update_guard = self.last_update.lock().await;
@@ -40,18 +42,16 @@ impl MasternodeCache {
 
         // Return the cached data
         let cached_data = {
-            let data = self.data.read()
-                .map_err(|_| "Failed to read cache")?;
+            let data = self.data.read().map_err(|_| "Failed to read cache")?;
             data.clone()
         };
-        
+
         match cached_data {
             Some(masternodes) => Ok(masternodes),
             None => {
                 // This shouldn't happen as we just updated, but handle it gracefully
                 self.update_cache().await?;
-                let data = self.data.read()
-                    .map_err(|_| "Failed to read cache")?;
+                let data = self.data.read().map_err(|_| "Failed to read cache")?;
                 Ok(data.as_ref().ok_or("No masternode data available")?.clone())
             }
         }
@@ -63,8 +63,9 @@ impl MasternodeCache {
         // Wrap the entire operation in a timeout (30 seconds)
         let result = tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
-            self.update_cache_internal()
-        ).await;
+            self.update_cache_internal(),
+        )
+        .await;
 
         match result {
             Ok(Ok(())) => Ok(()),
@@ -80,12 +81,16 @@ impl MasternodeCache {
         // Fetch new data
         let mut masternodes = masternode_loader::load_masternode_list(&self.config).await?;
 
-        println!("Checking version for {} Evo masternodes...", masternodes.len());
-        
+        println!(
+            "Checking version for {} Evo masternodes...",
+            masternodes.len()
+        );
+
         // Check version for each masternode
         let check_tasks: Vec<_> = masternodes.iter().enumerate().map(|(idx, node)| {
             let address = node.address.clone();
             let status = node.status.clone();
+            let platform_http_port = node.platform_http_port;
             let config = self.config.clone();
 
             async move {
@@ -97,23 +102,17 @@ impl MasternodeCache {
                     return (idx, "fail".to_string(), None, None, start.elapsed());
                 }
 
-                // Parse address to get IP and port, applying localhost replacement if configured
-                let resolved_address = config.replace_localhost(&address);
-                let parts: Vec<&str> = resolved_address.split(':').collect();
-                if parts.len() != 2 {
-                    println!("❌ Node {} at {} - invalid address format", idx, address);
-                    return (idx, "fail".to_string(), None, None, start.elapsed());
-                }
-
-                let ip = parts[0].to_string();
-                let port = config.get_dapi_port();
+                // Get the host to use for version check (may be replaced by version_check_host)
+                let ip = config.get_version_check_host(&address);
+                // Use platformHTTPPort from masternode info, fallback to config default
+                let port = platform_http_port.unwrap_or_else(|| config.get_dapi_port());
 
                 println!("🔍 Node {} at {} (resolved: {}:{}) - checking version...", idx, address, ip, port);
 
                 // Check version with additional timeout wrapper (2 seconds total)
                 let result = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(2),
-                    grpc_client::check_node_version(&ip, port)
+                    grpc_client::check_node_version(&ip, port, config.network)
                 ).await {
                     Ok(Ok(result)) => {
                         let elapsed = start.elapsed();
@@ -141,7 +140,7 @@ impl MasternodeCache {
                 result
             }
         }).collect();
-        
+
         // Execute all version checks concurrently
         let overall_start = std::time::Instant::now();
         let results = futures::future::join_all(check_tasks).await;
@@ -162,33 +161,44 @@ impl MasternodeCache {
             }
         }
 
-        let success_count = masternodes.iter().filter(|n| n.version_check == "success").count();
-        let fail_count = masternodes.iter().filter(|n| n.version_check == "fail").count();
-        println!("Version check complete: {} success, {} fail (total time: {:?})", success_count, fail_count, total_elapsed);
+        let success_count = masternodes
+            .iter()
+            .filter(|n| n.version_check == "success")
+            .count();
+        let fail_count = masternodes
+            .iter()
+            .filter(|n| n.version_check == "fail")
+            .count();
+        println!(
+            "Version check complete: {} success, {} fail (total time: {:?})",
+            success_count, fail_count, total_elapsed
+        );
 
         // Report slow nodes
         if !slow_nodes.is_empty() {
-            println!("\n🐌 SLOW NODES DETECTED ({} nodes took >2s):", slow_nodes.len());
+            println!(
+                "\n🐌 SLOW NODES DETECTED ({} nodes took >2s):",
+                slow_nodes.len()
+            );
             slow_nodes.sort_by(|a, b| b.2.cmp(&a.2)); // Sort by duration, slowest first
             for (idx, address, duration) in slow_nodes.iter().take(10) {
                 println!("   Node {} at {} took {:?}", idx, address, duration);
             }
             println!();
         }
-        
+
         // Update the cache
         {
-            let mut data = self.data.write()
-                .map_err(|_| "Failed to write to cache")?;
+            let mut data = self.data.write().map_err(|_| "Failed to write to cache")?;
             *data = Some(masternodes);
         }
-        
+
         // Update the timestamp
         {
             let mut last_update = self.last_update.lock().await;
             *last_update = Some(Instant::now());
         }
-        
+
         println!("Masternode cache updated successfully");
         Ok(())
     }
@@ -198,10 +208,20 @@ impl MasternodeCache {
             loop {
                 tokio::time::sleep(self.update_interval).await;
                 let now = Local::now();
-                println!("🔄 [{}] Background refresh: Starting masternode cache update...", now.format("%Y-%m-%d %H:%M:%S"));
+                println!(
+                    "🔄 [{}] Background refresh: Starting masternode cache update...",
+                    now.format("%Y-%m-%d %H:%M:%S")
+                );
                 match self.update_cache().await {
-                    Ok(_) => println!("✅ [{}] Background refresh: Masternode cache updated successfully", Local::now().format("%Y-%m-%d %H:%M:%S")),
-                    Err(e) => eprintln!("❌ [{}] Background refresh: Failed to update masternode cache: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), e),
+                    Ok(_) => println!(
+                        "✅ [{}] Background refresh: Masternode cache updated successfully",
+                        Local::now().format("%Y-%m-%d %H:%M:%S")
+                    ),
+                    Err(e) => eprintln!(
+                        "❌ [{}] Background refresh: Failed to update masternode cache: {}",
+                        Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        e
+                    ),
                 }
             }
         });
