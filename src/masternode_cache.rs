@@ -98,15 +98,8 @@ impl MasternodeCache {
                     return (idx, "fail".to_string(), None, None, start.elapsed());
                 }
 
-                // Parse address to get IP, applying localhost replacement if configured
-                let resolved_address = config.replace_localhost(&address);
-                let parts: Vec<&str> = resolved_address.split(':').collect();
-                if parts.len() != 2 {
-                    println!("❌ Node {} at {} - invalid address format", idx, address);
-                    return (idx, "fail".to_string(), None, None, start.elapsed());
-                }
-
-                let ip = parts[0].to_string();
+                // Get the host to use for version check (may be replaced by version_check_host)
+                let ip = config.get_version_check_host(&address);
                 // Use platformHTTPPort from masternode info, fallback to config default
                 let port = platform_http_port.unwrap_or_else(|| config.get_dapi_port());
 
@@ -115,7 +108,7 @@ impl MasternodeCache {
                 // Check version with additional timeout wrapper (2 seconds total)
                 let result = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(2),
-                    grpc_client::check_node_version(&ip, port)
+                    grpc_client::check_node_version(&ip, port, config.network)
                 ).await {
                     Ok(Ok(result)) => {
                         let elapsed = start.elapsed();

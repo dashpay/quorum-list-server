@@ -77,11 +77,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DockerConfig {
-    /// Replace 127.0.0.1 in masternode addresses with this host.
-    /// Useful when running in Docker to reach host services.
+    /// Use this host for version checks instead of the masternode's reported address.
+    /// Useful when running in Docker where the reported IPs are not reachable.
     /// Example: "host.docker.internal" for Docker Desktop
     #[serde(default)]
-    pub localhost_replacement: Option<String>,
+    pub version_check_host: Option<String>,
+
+    /// Replace the host in masternode addresses returned by the /masternodes endpoint.
+    /// Useful when clients need to connect via a different host than what's reported.
+    /// Example: "127.0.0.1" for local testing
+    #[serde(default)]
+    pub address_host_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,8 +180,12 @@ impl Config {
                 Network::try_from(network_str.as_str()).unwrap_or_else(|e| panic!("{}", e));
         }
 
-        if let Ok(localhost_replacement) = std::env::var("LOCALHOST_REPLACEMENT") {
-            config.docker.localhost_replacement = Some(localhost_replacement);
+        if let Ok(version_check_host) = std::env::var("VERSION_CHECK_HOST") {
+            config.docker.version_check_host = Some(version_check_host);
+        }
+
+        if let Ok(address_host_override) = std::env::var("ADDRESS_HOST_OVERRIDE") {
+            config.docker.address_host_override = Some(address_host_override);
         }
 
         config
@@ -202,11 +212,32 @@ impl Config {
         self.network.dapi_port()
     }
 
-    /// Replace 127.0.0.1 in an address with the configured replacement host.
-    /// Returns the original address if no replacement is configured.
-    pub fn replace_localhost(&self, address: &str) -> String {
-        if let Some(ref replacement) = self.docker.localhost_replacement {
-            address.replace("127.0.0.1", replacement)
+    /// Get the host to use for version checks.
+    /// If version_check_host is configured, use that host instead of the original address host.
+    /// Returns the original host if no replacement is configured.
+    pub fn get_version_check_host(&self, address: &str) -> String {
+        if let Some(ref replacement) = self.docker.version_check_host {
+            replacement.clone()
+        } else {
+            // Extract host from address (format: "ip:port")
+            address
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| address.to_string())
+        }
+    }
+
+    /// Apply address host override to an address string.
+    /// If address_host_override is configured, replace the host portion while keeping the port.
+    /// Returns the original address if no override is configured.
+    pub fn apply_address_host_override(&self, address: &str) -> String {
+        if let Some(ref override_host) = self.docker.address_host_override {
+            // Extract port from address (format: "ip:port")
+            if let Some((_, port)) = address.rsplit_once(':') {
+                format!("{}:{}", override_host, port)
+            } else {
+                address.to_string()
+            }
         } else {
             address.to_string()
         }

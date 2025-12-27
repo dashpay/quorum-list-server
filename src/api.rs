@@ -220,10 +220,20 @@ async fn get_previous_quorums(
 
 #[axum::debug_handler]
 async fn get_masternodes(
-    State((_, _, masternode_cache)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((_, config, masternode_cache)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<EvoMasternodeList>>, StatusCode> {
     match masternode_cache.get_masternodes().await {
-        Ok(masternodes) => Ok(Json(ApiResponse::success(masternodes))),
+        Ok(masternodes) => {
+            // Apply address host override if configured
+            let masternodes: EvoMasternodeList = masternodes
+                .into_iter()
+                .map(|mut m| {
+                    m.address = config.apply_address_host_override(&m.address);
+                    m
+                })
+                .collect();
+            Ok(Json(ApiResponse::success(masternodes)))
+        }
         Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load masternodes: {}", e))))
     }
 }
