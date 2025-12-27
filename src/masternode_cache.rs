@@ -86,6 +86,7 @@ impl MasternodeCache {
         let check_tasks: Vec<_> = masternodes.iter().enumerate().map(|(idx, node)| {
             let address = node.address.clone();
             let status = node.status.clone();
+            let platform_http_port = node.platform_http_port;
             let config = self.config.clone();
 
             async move {
@@ -97,7 +98,7 @@ impl MasternodeCache {
                     return (idx, "fail".to_string(), None, None, start.elapsed());
                 }
 
-                // Parse address to get IP and port, applying localhost replacement if configured
+                // Parse address to get IP, applying localhost replacement if configured
                 let resolved_address = config.replace_localhost(&address);
                 let parts: Vec<&str> = resolved_address.split(':').collect();
                 if parts.len() != 2 {
@@ -106,7 +107,8 @@ impl MasternodeCache {
                 }
 
                 let ip = parts[0].to_string();
-                let port = config.get_dapi_port();
+                // Use platformHTTPPort from masternode info, fallback to config default
+                let port = platform_http_port.unwrap_or_else(|| config.get_dapi_port());
 
                 println!("🔍 Node {} at {} (resolved: {}:{}) - checking version...", idx, address, ip, port);
 
