@@ -1,3 +1,4 @@
+use crate::config::Network;
 use semver::Version;
 use std::time::Duration;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -16,21 +17,31 @@ pub mod platform {
 use platform::{platform_client::PlatformClient, get_status_request::GetStatusRequestV0};
 use platform::GetStatusRequest;
 
-pub async fn check_node_version(address: &str, port: u16) -> Result<VersionCheckResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Parse the address and create the endpoint
-    let endpoint = format!("https://{}:{}", address, port);
-    
+pub async fn check_node_version(address: &str, port: u16, network: Network) -> Result<VersionCheckResult, Box<dyn std::error::Error + Send + Sync>> {
     // Create a channel with TLS configuration
-    let tls = ClientTlsConfig::new()
-        .with_native_roots()
-        .assume_http2(true);
-    
-    let channel = Channel::from_shared(endpoint)?
-        .tls_config(tls)?
-        .timeout(Duration::from_secs(2))
-        .connect_timeout(Duration::from_secs(2))
-        .connect()
-        .await?;
+    // For regtest, use HTTP (no TLS) since local nodes use self-signed certs
+    // For mainnet/testnet, use HTTPS with proper certificate verification
+    let channel = if network == Network::Regtest {
+        // For regtest, use plain HTTP to avoid certificate issues
+        let endpoint = format!("http://{}:{}", address, port);
+        Channel::from_shared(endpoint)?
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(2))
+            .connect()
+            .await?
+    } else {
+        let endpoint = format!("https://{}:{}", address, port);
+        let tls = ClientTlsConfig::new()
+            .with_native_roots()
+            .assume_http2(true);
+
+        Channel::from_shared(endpoint)?
+            .tls_config(tls)?
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(2))
+            .connect()
+            .await?
+    };
     
     // Create the gRPC client
     let mut client = PlatformClient::new(channel);

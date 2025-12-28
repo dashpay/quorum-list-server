@@ -40,6 +40,8 @@ pub struct EvoMasternodeInfo {
     pub pro_tx_hash: String,
     pub address: String,
     pub status: String,
+    #[serde(rename = "platformHTTPPort", skip_serializing_if = "Option::is_none")]
+    pub platform_http_port: Option<u16>,
     #[serde(rename = "versionCheck")]
     pub version_check: String, // "success", "fail", or "pending"
     #[serde(rename = "dapiVersion", skip_serializing_if = "Option::is_none")]
@@ -57,11 +59,12 @@ impl From<MasternodeInfo> for Option<EvoMasternodeInfo> {
             } else {
                 "pending".to_string()
             };
-            
+
             Some(EvoMasternodeInfo {
                 pro_tx_hash: info.pro_tx_hash,
                 address: info.address,
                 status: info.status,
+                platform_http_port: info.platform_http_port,
                 version_check,
                 dapi_version: None,
                 drive_version: None,
