@@ -3,6 +3,8 @@ services:
     image: dashpay/dashd:latest
     container_name: dashcore
     restart: unless-stopped
+    profiles:
+      - standalone
     volumes:
       - dashcore-data:/home/dash/.dashcore
       - ./dashcore-config/dash.${DASH_NETWORK}.conf:/home/dash/.dashcore/dash.conf:ro
@@ -24,10 +26,11 @@ services:
     depends_on:
       dashcore:
         condition: service_healthy
+        required: false
     ports:
       - "${API_PORT:-3000}:${API_PORT:-3000}"
     environment:
-      - DASH_RPC_URL=http://dashcore:${DASH_RPC_PORT}
+      - DASH_RPC_URL=http://${DASH_RPC_HOST:-host.docker.internal}:${DASH_RPC_PORT}
       - DASH_RPC_USER=${DASH_RPC_USER:-dashrpc}
       - DASH_RPC_PASSWORD=${DASH_RPC_PASSWORD}
       - DASH_NETWORK=${DASH_NETWORK}

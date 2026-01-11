@@ -88,35 +88,55 @@ The server reads `/app/config.toml` first; environment variables are only used w
 
 ## Docker Compose
 
-Run quorum-list-server with Dash Core in a single command:
+Run quorum-list-server with Docker Compose in two modes:
 
-### Quick Start
+### Standalone Mode (bundled Dash Core)
 
-1. Copy the example environment file:
+Run with a bundled Dash Core instance:
+
+1. Copy and configure environment:
    ```bash
    cp .env.example .env
    ```
 
-2. Edit `.env` and set:
+2. Edit `.env`:
    - `DASH_NETWORK` - `mainnet`, `testnet`, or `regtest`
    - `DASH_RPC_PASSWORD` - a secure password
    - `DASH_RPC_PORT` - must match network (mainnet=9998, testnet=19998, regtest=19898)
+   - `DASH_RPC_HOST=dashcore` - use bundled Dash Core
 
 3. Update password in `dashcore-config/dash.{network}.conf` to match
 
-4. Start services:
+4. Start with the standalone profile:
+   ```bash
+   docker compose --profile standalone up -d
+   ```
+
+### Shared Mode (external Dash Core)
+
+Share Dash Core with another service (e.g., platform-identity-faucet):
+
+1. Ensure the other service exposes Dash Core RPC on the host (e.g., port 19998)
+
+2. Copy and configure environment:
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Edit `.env`:
+   - `DASH_NETWORK` - must match the external Dash Core
+   - `DASH_RPC_PASSWORD` - must match the external Dash Core
+   - `DASH_RPC_PORT` - must match the external Dash Core
+   - `DASH_RPC_HOST` - leave unset (defaults to `host.docker.internal`)
+
+4. Start without the standalone profile:
    ```bash
    docker compose up -d
    ```
 
-5. Check logs:
-   ```bash
-   docker compose logs -f
-   ```
-
 ### Network Configuration
 
-| Network  | RPC Port | Config File                        |
+| Network  | RPC Port | Config File (standalone only)      |
 |----------|----------|------------------------------------|
 | mainnet  | 9998     | dashcore-config/dash.mainnet.conf  |
 | testnet  | 19998    | dashcore-config/dash.testnet.conf  |
@@ -124,9 +144,7 @@ Run quorum-list-server with Dash Core in a single command:
 
 ### Volumes
 
-- `dashcore-data` - Persistent blockchain data
-
-Note: Initial blockchain sync may take hours (mainnet) or minutes (testnet). Check progress with `docker compose logs dashcore`.
+- `dashcore-data` - Persistent blockchain data (standalone mode only)
 
 ## API Examples
 
