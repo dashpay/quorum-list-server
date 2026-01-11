@@ -106,6 +106,12 @@ pub struct RpcConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuorumConfig {
     pub previous_blocks_offset: u32,
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_seconds: u64,
+}
+
+fn default_cache_ttl() -> u64 {
+    60
 }
 
 impl Default for Config {
@@ -122,6 +128,7 @@ impl Default for Config {
             },
             quorum: QuorumConfig {
                 previous_blocks_offset: 8,
+                cache_ttl_seconds: default_cache_ttl(),
             },
             network: Network::default(),
             docker: DockerConfig::default(),
@@ -173,6 +180,12 @@ impl Config {
         if let Ok(offset) = std::env::var("QUORUM_PREVIOUS_BLOCKS_OFFSET") {
             if let Ok(offset_num) = offset.parse::<u32>() {
                 config.quorum.previous_blocks_offset = offset_num;
+            }
+        }
+
+        if let Ok(ttl) = std::env::var("QUORUM_CACHE_TTL_SECONDS") {
+            if let Ok(ttl_num) = ttl.parse::<u64>() {
+                config.quorum.cache_ttl_seconds = ttl_num;
             }
         }
 
