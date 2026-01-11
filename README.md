@@ -86,6 +86,48 @@ docker run --rm -p 8080:8080 \
 
 The server reads `/app/config.toml` first; environment variables are only used when that file is absent.
 
+## Docker Compose
+
+Run quorum-list-server with Dash Core in a single command:
+
+### Quick Start
+
+1. Copy the example environment file:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and set:
+   - `DASH_NETWORK` - `mainnet`, `testnet`, or `regtest`
+   - `DASH_RPC_PASSWORD` - a secure password
+   - `DASH_RPC_PORT` - must match network (mainnet=9998, testnet=19998, regtest=19898)
+
+3. Update password in `dashcore-config/dash.{network}.conf` to match
+
+4. Start services:
+   ```bash
+   docker compose up -d
+   ```
+
+5. Check logs:
+   ```bash
+   docker compose logs -f
+   ```
+
+### Network Configuration
+
+| Network  | RPC Port | Config File                        |
+|----------|----------|------------------------------------|
+| mainnet  | 9998     | dashcore-config/dash.mainnet.conf  |
+| testnet  | 19998    | dashcore-config/dash.testnet.conf  |
+| regtest  | 19898    | dashcore-config/dash.regtest.conf  |
+
+### Volumes
+
+- `dashcore-data` - Persistent blockchain data
+
+Note: Initial blockchain sync may take hours (mainnet) or minutes (testnet). Check progress with `docker compose logs dashcore`.
+
 ## API Examples
 
 ```bash

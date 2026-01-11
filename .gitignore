@@ -22,3 +22,6 @@ target/
 
 # Logs
 debug.log
+
+# Docker compose blockchain data
+dashcore-data/
