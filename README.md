@@ -22,7 +22,6 @@ A Rust-based HTTP API server that provides RESTful endpoints for managing Dash L
 - `GET /quorums/stats` - Get quorum statistics 
 - `GET /quorums/{hash}` - Get specific quorum by hash
 - `GET /previous` - Get quorums from previous blocks (configurable offset)
-- `POST /quorums/clear` - Clear all quorums
 
 ## Configuration
 
@@ -104,9 +103,6 @@ curl http://localhost:3000/previous
 
 # Get specific quorum by hash
 curl http://localhost:3000/quorums/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-
-# Clear all quorums
-curl -X POST http://localhost:3000/quorums/clear
 ```
 
 ## Response Format
