@@ -114,9 +114,9 @@ Run with a bundled Dash Core instance:
 
 ### Shared Mode (external Dash Core)
 
-Share Dash Core with another service (e.g., platform-identity-faucet):
+Share Dash Core with another service (e.g., platform-identity-faucet) via the `dash-net` network:
 
-1. Ensure the other service exposes Dash Core RPC on the host (e.g., port 19998)
+1. Ensure platform-identity-faucet is running (creates the `dash-net` network)
 
 2. Copy and configure environment:
    ```bash
@@ -127,7 +127,7 @@ Share Dash Core with another service (e.g., platform-identity-faucet):
    - `DASH_NETWORK` - must match the external Dash Core
    - `DASH_RPC_PASSWORD` - must match the external Dash Core
    - `DASH_RPC_PORT` - must match the external Dash Core
-   - `DASH_RPC_HOST` - leave unset (defaults to `host.docker.internal`)
+   - `DASH_RPC_HOST` - leave unset (defaults to `faucet-dashcore`)
 
 4. Start without the standalone profile:
    ```bash

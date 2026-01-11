@@ -30,7 +30,7 @@ services:
     ports:
       - "${API_PORT:-3000}:${API_PORT:-3000}"
     environment:
-      - DASH_RPC_URL=http://${DASH_RPC_HOST:-host.docker.internal}:${DASH_RPC_PORT}
+      - DASH_RPC_URL=http://${DASH_RPC_HOST:-faucet-dashcore}:${DASH_RPC_PORT}
       - DASH_RPC_USER=${DASH_RPC_USER:-dashrpc}
       - DASH_RPC_PASSWORD=${DASH_RPC_PASSWORD}
       - DASH_NETWORK=${DASH_NETWORK}
@@ -40,10 +40,13 @@ services:
       - QUORUM_CACHE_TTL_SECONDS=${QUORUM_CACHE_TTL_SECONDS:-60}
     networks:
       - quorum-net
+      - dash-net
 
 networks:
   quorum-net:
     driver: bridge
+  dash-net:
+    external: true
 
 volumes:
   dashcore-data:
