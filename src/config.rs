@@ -9,6 +9,7 @@ pub enum Network {
     Mainnet,
     #[default]
     Testnet,
+    Devnet,
     Regtest,
 }
 
@@ -17,6 +18,7 @@ impl fmt::Display for Network {
         match self {
             Network::Mainnet => write!(f, "mainnet"),
             Network::Testnet => write!(f, "testnet"),
+            Network::Devnet => write!(f, "devnet"),
             Network::Regtest => write!(f, "regtest"),
         }
     }
@@ -29,9 +31,10 @@ impl TryFrom<&str> for Network {
         match s.to_lowercase().as_str() {
             "mainnet" => Ok(Network::Mainnet),
             "testnet" => Ok(Network::Testnet),
+            "devnet" => Ok(Network::Devnet),
             "regtest" => Ok(Network::Regtest),
             _ => Err(format!(
-                "Invalid network '{}'. Must be one of: mainnet, testnet, regtest",
+                "Invalid network '{}'. Must be one of: mainnet, testnet, devnet, regtest",
                 s
             )),
         }
@@ -43,6 +46,7 @@ impl Network {
         match self {
             Network::Mainnet => "llmq_100_67",
             Network::Testnet => "llmq_25_67",
+            Network::Devnet => "llmq_devnet_platform",
             Network::Regtest => "llmq_test_platform",
         }
     }
@@ -51,6 +55,7 @@ impl Network {
         match self {
             Network::Mainnet => 4,   // llmq_100_67 = type 4
             Network::Testnet => 6,   // llmq_25_67 = type 6
+            Network::Devnet => 107,  // llmq_devnet_platform = type 107
             Network::Regtest => 106, // llmq_test_platform = type 106
         }
     }
@@ -59,6 +64,7 @@ impl Network {
         match self {
             Network::Mainnet => 443,
             Network::Testnet => 1443,
+            Network::Devnet => 1443,
             Network::Regtest => 2443,
         }
     }
@@ -146,7 +152,6 @@ impl Config {
 
         // Fall back to environment variables or defaults
         let mut config = Config::default();
-
 
         if let Ok(port) = std::env::var("API_PORT") {
             if let Ok(port_num) = port.parse::<u16>() {
@@ -245,3 +250,42 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_platform_devnet() {
+        let network = Network::try_from("devnet").expect("devnet should parse");
+
+        assert_eq!(network, Network::Devnet);
+        assert_eq!(network.to_string(), "devnet");
+        assert_eq!(network.llmq_type(), "llmq_devnet_platform");
+        assert_eq!(network.llmq_type_id(), 107);
+        assert_eq!(network.dapi_port(), 1443);
+    }
+
+    #[test]
+    fn deserializes_platform_devnet() {
+        let toml = r#"
+network = "devnet"
+
+[server]
+port = 8080
+host = "0.0.0.0"
+
+[rpc]
+url = "http://127.0.0.1:20002"
+username = "dashrpc"
+password = "password"
+
+[quorum]
+previous_blocks_offset = 8
+"#;
+        let config: Config = toml::from_str(toml).expect("devnet config should deserialize");
+
+        assert_eq!(config.network, Network::Devnet);
+        assert_eq!(config.get_llmq_type(), "llmq_devnet_platform");
+        assert_eq!(config.get_llmq_type_id(), 107);
+    }
+}
