@@ -28,79 +28,46 @@ impl QuorumCache {
         }
     }
 
+    /// Read the cached current quorums.
+    ///
+    /// This never contacts Dash Core: the background refresh task is the only
+    /// writer. Serving a request must not depend on RPC latency.
     pub async fn get_quorums(
         &self,
     ) -> Result<QuorumList, Box<dyn std::error::Error + Send + Sync>> {
-        let should_update = {
-            let last_update_guard = self.current_last_update.lock().await;
-            match *last_update_guard {
-                None => true,
-                Some(last) => last.elapsed() >= self.update_interval,
-            }
-        };
-
-        if should_update {
-            self.update_current_cache().await?;
-        }
-
-        let cached_data = {
-            let data = self
-                .current_quorums
-                .read()
-                .map_err(|_| "Failed to read quorum cache")?;
-            data.clone()
-        };
-
-        match cached_data {
-            Some(quorums) => Ok(quorums),
-            None => {
-                self.update_current_cache().await?;
-                let data = self
-                    .current_quorums
-                    .read()
-                    .map_err(|_| "Failed to read quorum cache")?;
-                Ok(data.as_ref().ok_or("No quorum data available")?.clone())
-            }
-        }
+        let data = self
+            .current_quorums
+            .read()
+            .map_err(|_| "Failed to read quorum cache")?;
+        Ok(data
+            .as_ref()
+            .ok_or("Quorum cache is not populated yet")?
+            .clone())
     }
 
+    /// Read the cached previous quorums along with the height they were taken at.
+    ///
+    /// As with [`Self::get_quorums`], this is a pure cache read.
     pub async fn get_previous_quorums(
         &self,
     ) -> Result<(u32, QuorumList), Box<dyn std::error::Error + Send + Sync>> {
-        let should_update = {
-            let last_update_guard = self.previous_last_update.lock().await;
-            match *last_update_guard {
-                None => true,
-                Some(last) => last.elapsed() >= self.update_interval,
-            }
-        };
+        let data = self
+            .previous_quorums
+            .read()
+            .map_err(|_| "Failed to read previous quorum cache")?;
+        Ok(data
+            .as_ref()
+            .ok_or("Previous quorum cache is not populated yet")?
+            .clone())
+    }
 
-        if should_update {
-            self.update_previous_cache().await?;
-        }
-
-        let cached_data = {
-            let data = self
-                .previous_quorums
-                .read()
-                .map_err(|_| "Failed to read previous quorum cache")?;
-            data.clone()
-        };
-
-        match cached_data {
-            Some(quorums) => Ok(quorums),
-            None => {
-                self.update_previous_cache().await?;
-                let data = self
-                    .previous_quorums
-                    .read()
-                    .map_err(|_| "Failed to read previous quorum cache")?;
-                Ok(data
-                    .as_ref()
-                    .ok_or("No previous quorum data available")?
-                    .clone())
-            }
-        }
+    /// Refresh both quorum caches from Dash Core.
+    ///
+    /// Called once at startup and then only by the background refresh task.
+    pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.update_current_cache().await?;
+        self.update_previous_cache().await?;
+        Ok(())
     }
 
     async fn update_current_cache(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

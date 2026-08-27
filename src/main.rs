@@ -34,12 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Populate quorum cache on startup
     println!("Loading initial quorums...");
-    match quorum_cache.get_quorums().await {
-        Ok(quorums) => {
-            println!("Successfully loaded {} quorums into cache", quorums.len());
-        }
+    match quorum_cache.refresh().await {
+        Ok(()) => match quorum_cache.get_quorums().await {
+            Ok(quorums) => println!("Successfully loaded {} quorums into cache", quorums.len()),
+            Err(e) => eprintln!("Warning: quorum cache unreadable after refresh: {}", e),
+        },
         Err(e) => {
-            eprintln!("Warning: Failed to load initial quorums: {}. Cache will populate on first request.", e);
+            eprintln!("Warning: Failed to load initial quorums: {}. Endpoints will error until the background refresh succeeds.", e);
         }
     }
 
@@ -51,12 +52,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Populate masternode cache on startup
     println!("Loading initial masternode list...");
-    match masternode_cache.get_masternodes().await {
-        Ok(masternodes) => {
-            println!("Successfully loaded {} masternodes into cache", masternodes.len());
-        }
+    match masternode_cache.refresh().await {
+        Ok(()) => match masternode_cache.get_masternodes().await {
+            Ok(masternodes) => {
+                println!("Successfully loaded {} masternodes into cache", masternodes.len())
+            }
+            Err(e) => eprintln!("Warning: masternode cache unreadable after refresh: {}", e),
+        },
         Err(e) => {
-            eprintln!("Warning: Failed to load initial masternodes: {}. Cache will populate on first request.", e);
+            eprintln!("Warning: Failed to load initial masternodes: {}. /masternodes will error until the background refresh succeeds.", e);
         }
     }
     
