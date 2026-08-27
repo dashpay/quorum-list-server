@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 pub type SharedQuorumCache = Arc<QuorumCache>;
@@ -111,6 +112,8 @@ pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode
         .route("/masternodes", get(get_masternodes))
         .with_state((quorum_cache, shared_config, masternode_cache))
         .layer(CorsLayer::permissive())
+        // Responses are highly repetitive JSON; /masternodes is ~67 KB uncompressed.
+        .layer(CompressionLayer::new())
 }
 
 async fn health_check() -> Json<ApiResponse<String>> {
