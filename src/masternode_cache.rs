@@ -24,37 +24,25 @@ impl MasternodeCache {
         }
     }
 
+    /// Read the cached masternode list.
+    ///
+    /// This never contacts Dash Core or probes any masternode: the background
+    /// refresh task is the only writer.
     pub async fn get_masternodes(
         &self,
     ) -> Result<EvoMasternodeList, Box<dyn std::error::Error + Send + Sync>> {
-        // Check if we need to update the cache
-        let should_update = {
-            let last_update_guard = self.last_update.lock().await;
-            match *last_update_guard {
-                None => true,
-                Some(last) => last.elapsed() >= self.update_interval,
-            }
-        };
+        let data = self.data.read().map_err(|_| "Failed to read cache")?;
+        Ok(data
+            .as_ref()
+            .ok_or("Masternode cache is not populated yet")?
+            .clone())
+    }
 
-        if should_update {
-            self.update_cache().await?;
-        }
-
-        // Return the cached data
-        let cached_data = {
-            let data = self.data.read().map_err(|_| "Failed to read cache")?;
-            data.clone()
-        };
-
-        match cached_data {
-            Some(masternodes) => Ok(masternodes),
-            None => {
-                // This shouldn't happen as we just updated, but handle it gracefully
-                self.update_cache().await?;
-                let data = self.data.read().map_err(|_| "Failed to read cache")?;
-                Ok(data.as_ref().ok_or("No masternode data available")?.clone())
-            }
-        }
+    /// Refresh the masternode cache from Dash Core.
+    ///
+    /// Called once at startup and then only by the background refresh task.
+    pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.update_cache().await
     }
 
     async fn update_cache(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

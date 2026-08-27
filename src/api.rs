@@ -1,19 +1,21 @@
 use crate::config::Config;
-use crate::quorum_list::{QuorumList, QuorumListEntry};
 use crate::masternode::EvoMasternodeList;
 use crate::masternode_cache::MasternodeCache;
+use crate::quorum_cache::QuorumCache;
+use crate::quorum_list::QuorumListEntry;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::Serialize;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
-pub type SharedQuorumList = Arc<RwLock<QuorumList>>;
+pub type SharedQuorumCache = Arc<QuorumCache>;
 pub type SharedConfig = Arc<Config>;
 pub type SharedMasternodeCache = Arc<MasternodeCache>;
 
@@ -99,18 +101,19 @@ impl From<&QuorumListEntry> for QuorumEntryResponse {
 }
 
 
-pub fn create_router(shared_list: SharedQuorumList, config: Config, masternode_cache: SharedMasternodeCache) -> Router {
+pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode_cache: SharedMasternodeCache) -> Router {
     let shared_config = Arc::new(config);
     Router::new()
         .route("/health", get(health_check))
         .route("/quorums", get(get_all_quorums))
         .route("/quorums/stats", get(get_quorum_stats))
-        .route("/quorums/clear", post(clear_quorums))
         .route("/previous", get(get_previous_quorums))
         .route("/quorums/:hash", get(get_quorum_by_hash))
         .route("/masternodes", get(get_masternodes))
-        .with_state((shared_list, shared_config, masternode_cache))
+        .with_state((quorum_cache, shared_config, masternode_cache))
         .layer(CorsLayer::permissive())
+        // Responses are highly repetitive JSON; /masternodes is ~67 KB uncompressed.
+        .layer(CompressionLayer::new())
 }
 
 async fn health_check() -> Json<ApiResponse<String>> {
@@ -118,109 +121,70 @@ async fn health_check() -> Json<ApiResponse<String>> {
 }
 
 async fn get_all_quorums(
-    State((shared_list, config, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<Vec<QuorumEntryResponse>>>, StatusCode> {
-    // Fetch fresh quorums from Dash Core
-    match crate::quorum_loader::load_initial_quorums(&config).await {
-        Ok(new_quorums) => {
-            // Update the shared list with fresh data
-            match shared_list.write() {
-                Ok(mut list) => {
-                    *list = new_quorums;
-                }
-                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-            }
-            
-            // Now read and return the updated list
-            match shared_list.read() {
-                Ok(list) => {
-                    let quorums: Vec<QuorumEntryResponse> = list.iter().map(|entry| entry.into()).collect();
-                    Ok(Json(ApiResponse::success(quorums)))
-                }
-                Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-            }
+    match quorum_cache.get_quorums().await {
+        Ok(quorums) => {
+            let quorums: Vec<QuorumEntryResponse> = quorums.iter().map(|entry| entry.into()).collect();
+            Ok(Json(ApiResponse::success(quorums)))
         }
         Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load quorums: {}", e))))
     }
 }
 
 async fn get_quorum_stats(
-    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumStats>>, StatusCode> {
-    match shared_list.read() {
-        Ok(list) => {
+    match quorum_cache.get_quorums().await {
+        Ok(quorums) => {
             let stats = QuorumStats {
-                total_count: list.len(),
-                is_empty: list.is_empty(),
+                total_count: quorums.len(),
+                is_empty: quorums.is_empty(),
             };
             Ok(Json(ApiResponse::success(stats)))
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to get quorum stats: {}", e))))
     }
 }
 
 async fn get_quorum_by_hash(
     Path(hash): Path<String>,
-    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumEntryResponse>>, StatusCode> {
     let hash_bytes = match hex::decode(&hash) {
         Ok(bytes) if bytes.len() == 32 => bytes,
         _ => return Ok(Json(ApiResponse::error("Invalid hash format. Must be 32 bytes hex encoded.".to_string()))),
     };
 
-    match shared_list.read() {
-        Ok(list) => {
-            if let Some(entry) = list.get_entry(&hash_bytes) {
+    match quorum_cache.get_quorums().await {
+        Ok(quorums) => {
+            if let Some(entry) = quorums.get_entry(&hash_bytes) {
                 Ok(Json(ApiResponse::success(entry.into())))
             } else {
                 Ok(Json(ApiResponse::error("Quorum not found".to_string())))
             }
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-
-async fn clear_quorums(
-    State((shared_list, _, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
-) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    match shared_list.write() {
-        Ok(mut list) => {
-            list.clear();
-            Ok(Json(ApiResponse::success("All quorums cleared successfully".to_string())))
-        }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to get quorums: {}", e))))
     }
 }
 
 #[axum::debug_handler]
 async fn get_previous_quorums(
-    State((_, config, _)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<QuorumsAtHeightResponse>>, StatusCode> {
-    match crate::quorum_loader::get_current_block_height(&config).await {
-        Ok(current_height) => {
-            let previous_height = if current_height >= config.quorum.previous_blocks_offset { 
-                current_height - config.quorum.previous_blocks_offset 
-            } else { 
-                0 
-            };
-            
-            match crate::quorum_loader::load_quorums_at_height(&config, previous_height).await {
-                Ok(quorum_list) => {
-                    let quorums: Vec<QuorumEntryResponse> = quorum_list.iter().map(|entry| entry.into()).collect();
-                    let response = QuorumsAtHeightResponse { height: previous_height, quorums };
-                    Ok(Json(ApiResponse::success(response)))
-                }
-                Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load quorums: {}", e))))
-            }
+    match quorum_cache.get_previous_quorums().await {
+        Ok((height, quorum_list)) => {
+            let quorums: Vec<QuorumEntryResponse> = quorum_list.iter().map(|entry| entry.into()).collect();
+            let response = QuorumsAtHeightResponse { height, quorums };
+            Ok(Json(ApiResponse::success(response)))
         }
-        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to get block height: {}", e))))
+        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load previous quorums: {}", e))))
     }
 }
 
 #[axum::debug_handler]
 async fn get_masternodes(
-    State((_, config, masternode_cache)): State<(SharedQuorumList, SharedConfig, SharedMasternodeCache)>,
+    State((_, config, masternode_cache)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<EvoMasternodeList>>, StatusCode> {
     match masternode_cache.get_masternodes().await {
         Ok(masternodes) => {

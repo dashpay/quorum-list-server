@@ -2,16 +2,16 @@ mod api;
 mod config;
 mod quorum_list;
 mod quorum_loader;
+mod quorum_cache;
 mod masternode;
 mod masternode_loader;
 mod masternode_cache;
 mod grpc_client;
 
-use api::SharedQuorumList;
 use config::Config;
-use quorum_list::QuorumList;
 use masternode_cache::MasternodeCache;
-use std::sync::{Arc, RwLock};
+use quorum_cache::QuorumCache;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -27,33 +27,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  LLMQ Type: {} (ID: {})", config.get_llmq_type(), config.get_llmq_type_id());
     println!("  DAPI Port: {}", config.get_dapi_port());
     println!("  Previous blocks offset: {}", config.quorum.previous_blocks_offset);
-    
-    // Load initial quorums from Dash Core
-    println!("Loading initial quorums from Dash Core...");
-    let initial_quorums = match quorum_loader::load_initial_quorums(&config).await {
-        Ok(quorums) => {
-            println!("Successfully loaded {} quorums", quorums.len());
-            quorums
-        }
+    println!("  Quorum cache TTL: {}s", config.quorum.cache_ttl_seconds);
+
+    // Create quorum cache
+    let quorum_cache = Arc::new(QuorumCache::new(config.clone()));
+
+    // Populate quorum cache on startup
+    println!("Loading initial quorums...");
+    match quorum_cache.refresh().await {
+        Ok(()) => match quorum_cache.get_quorums().await {
+            Ok(quorums) => println!("Successfully loaded {} quorums into cache", quorums.len()),
+            Err(e) => eprintln!("Warning: quorum cache unreadable after refresh: {}", e),
+        },
         Err(e) => {
-            println!("Warning: Failed to load initial quorums: {}. Starting with empty list.", e);
-            QuorumList::new()
+            eprintln!("Warning: Failed to load initial quorums: {}. Endpoints will error until the background refresh succeeds.", e);
         }
-    };
-    
-    let shared_quorum_list: SharedQuorumList = Arc::new(RwLock::new(initial_quorums));
-    
+    }
+
+    // Start background refresh for quorum cache
+    quorum_cache.clone().start_background_refresh().await;
+
     // Create masternode cache
     let masternode_cache = Arc::new(MasternodeCache::new(config.clone()));
     
     // Populate masternode cache on startup
     println!("Loading initial masternode list...");
-    match masternode_cache.get_masternodes().await {
-        Ok(masternodes) => {
-            println!("Successfully loaded {} masternodes into cache", masternodes.len());
-        }
+    match masternode_cache.refresh().await {
+        Ok(()) => match masternode_cache.get_masternodes().await {
+            Ok(masternodes) => {
+                println!("Successfully loaded {} masternodes into cache", masternodes.len())
+            }
+            Err(e) => eprintln!("Warning: masternode cache unreadable after refresh: {}", e),
+        },
         Err(e) => {
-            eprintln!("Warning: Failed to load initial masternodes: {}. Cache will populate on first request.", e);
+            eprintln!("Warning: Failed to load initial masternodes: {}. /masternodes will error until the background refresh succeeds.", e);
         }
     }
     
@@ -61,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     masternode_cache.clone().start_background_refresh().await;
     
     // Start the API server
-    let app = api::create_router(shared_quorum_list.clone(), config.clone(), masternode_cache.clone());
+    let app = api::create_router(quorum_cache.clone(), config.clone(), masternode_cache.clone());
     let listener = TcpListener::bind(format!("{}:{}", config.server.host, config.server.port)).await?;
     
     println!("API Server starting on {}:{}", config.server.host, config.server.port);
