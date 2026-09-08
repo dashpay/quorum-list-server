@@ -23,6 +23,46 @@ A Rust-based HTTP API server that provides RESTful endpoints for managing Dash L
 - `GET /quorums/{hash}` - Get specific quorum by hash
 - `GET /previous` - Get quorums from previous blocks (configurable offset)
 
+### Masternode bootstrap metadata
+
+`GET /masternodes` preserves the existing `data` array and adds `lastUpdated` to
+successful responses. It is the Unix timestamp in seconds when the last
+successfully cached DML fetch began. Repeated reads and failed refreshes do not
+advance it. The list and timestamp are published together; the endpoint performs
+no RPC calls or node probes. Clients should check both `success` and freshness
+before using the data (the refresh interval is ten minutes).
+
+Each evonode now includes `platformNodeID` and `platformP2PPort` when Core supplies
+them, alongside the existing `platformHTTPPort`. On Core versions that supply
+separate service endpoints, `addresses` preserves the `core_p2p`, `platform_p2p`,
+and `platform_https` arrays, including non-default ports and IPv6 addresses.
+Prefer `addresses.platform_p2p` when present; otherwise use the host in `address`
+with `platformP2PPort`. Missing fields are omitted rather than guessed. Configured
+address host overrides apply to these endpoint arrays as well as `address`.
+
+```json
+{
+  "success": true,
+  "data": [{
+    "proTxHash": "...",
+    "address": "192.0.2.1:9999",
+    "addresses": {"platform_p2p": ["192.0.2.2:27656"]},
+    "status": "ENABLED",
+    "platformNodeID": "...",
+    "platformP2PPort": 27656,
+    "platformHTTPPort": 443,
+    "versionCheck": "success"
+  }],
+  "message": null,
+  "lastUpdated": 1788828000
+}
+```
+
+The timestamp describes cache freshness, not Core synchronization or a successful
+Tenderdash P2P handshake. Consumers still need to exclude banned entries and
+validate the node ID and endpoint fields. Existing clients can continue reading
+`data` unchanged.
+
 ## Configuration
 
 ### config.toml

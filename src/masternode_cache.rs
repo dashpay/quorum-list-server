@@ -2,14 +2,20 @@ use crate::config::Config;
 use crate::grpc_client;
 use crate::masternode::EvoMasternodeList;
 use crate::masternode_loader;
-use chrono::Local;
+use chrono::{Local, Utc};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::Duration;
+
+/// The registry data and its successful fetch time are published atomically.
+#[derive(Clone)]
+pub struct MasternodeSnapshot {
+    pub masternodes: EvoMasternodeList,
+    /// Unix seconds, captured before loading the registry (not when serving it).
+    pub last_updated: i64,
+}
 
 pub struct MasternodeCache {
-    data: Arc<RwLock<Option<EvoMasternodeList>>>,
-    last_update: Arc<Mutex<Option<Instant>>>,
+    data: Arc<RwLock<Option<MasternodeSnapshot>>>,
     config: Arc<Config>,
     update_interval: Duration,
 }
@@ -18,7 +24,6 @@ impl MasternodeCache {
     pub fn new(config: Config) -> Self {
         Self {
             data: Arc::new(RwLock::new(None)),
-            last_update: Arc::new(Mutex::new(None)),
             config: Arc::new(config),
             update_interval: Duration::from_secs(600), // 10 minutes
         }
@@ -31,6 +36,13 @@ impl MasternodeCache {
     pub async fn get_masternodes(
         &self,
     ) -> Result<EvoMasternodeList, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.get_snapshot().await?.masternodes)
+    }
+
+    /// Read registry data and freshness from the same cached snapshot, without RPC.
+    pub async fn get_snapshot(
+        &self,
+    ) -> Result<MasternodeSnapshot, Box<dyn std::error::Error + Send + Sync>> {
         let data = self.data.read().map_err(|_| "Failed to read cache")?;
         Ok(data
             .as_ref()
@@ -66,6 +78,9 @@ impl MasternodeCache {
     }
 
     async fn update_cache_internal(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Only publish this time if loading and probing the new list succeed.
+        let last_updated = Utc::now().timestamp();
+
         // Fetch new data
         let mut masternodes = masternode_loader::load_masternode_list(&self.config).await?;
 
@@ -178,13 +193,10 @@ impl MasternodeCache {
         // Update the cache
         {
             let mut data = self.data.write().map_err(|_| "Failed to write to cache")?;
-            *data = Some(masternodes);
-        }
-
-        // Update the timestamp
-        {
-            let mut last_update = self.last_update.lock().await;
-            *last_update = Some(Instant::now());
+            *data = Some(MasternodeSnapshot {
+                masternodes,
+                last_updated,
+            });
         }
 
         println!("Masternode cache updated successfully");
@@ -213,5 +225,105 @@ impl MasternodeCache {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{api, masternode::EvoMasternodeInfo, quorum_cache::QuorumCache};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use serde_json::{json, Value};
+    use tower::Service;
+
+    fn snapshot() -> MasternodeSnapshot {
+        MasternodeSnapshot {
+            last_updated: 1234567890,
+            masternodes: vec![EvoMasternodeInfo {
+                pro_tx_hash: "11".repeat(32),
+                address: "192.0.2.1:9999".into(),
+                addresses: Some(std::collections::HashMap::from([
+                    ("platform_p2p".into(), vec!["192.0.2.2:27656".into()]),
+                    ("platform_https".into(), vec!["192.0.2.3:1443".into()]),
+                ])),
+                status: "ENABLED".into(),
+                platform_node_id: Some("22".repeat(20)),
+                platform_p2p_port: Some(27656),
+                platform_http_port: Some(1443),
+                version_check: "success".into(),
+                dapi_version: None,
+                drive_version: None,
+            }],
+        }
+    }
+
+    async fn response(config: Config, cache: Arc<MasternodeCache>, uri: &str) -> Value {
+        let mut router =
+            api::create_router(Arc::new(QuorumCache::new(config.clone())), config, cache);
+        let response = router
+            .call(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_serve_fields_and_original_refresh_time_without_rpc() {
+        let mut config = Config::default();
+        // Even an accidentally attempted RPC cannot reach the network.
+        config.rpc.url = "not a URL".into();
+        let cache = Arc::new(MasternodeCache::new(config.clone()));
+        *cache.data.write().unwrap() = Some(snapshot());
+        let first = response(config.clone(), cache.clone(), "/masternodes").await;
+        assert_eq!(first["success"], true);
+        assert_eq!(first["lastUpdated"], 1234567890);
+        assert!(first["data"].is_array());
+        assert_eq!(first["data"][0]["platformNodeID"], "22".repeat(20));
+        assert_eq!(first["data"][0]["platformP2PPort"], 27656);
+        assert_eq!(
+            first["data"][0]["addresses"]["platform_p2p"],
+            json!(["192.0.2.2:27656"])
+        );
+        // A failed refresh must not stamp the old list with a new timestamp.
+        assert!(cache.refresh().await.is_err());
+        assert_eq!(response(config, cache, "/masternodes").await, first);
+    }
+
+    #[tokio::test]
+    async fn should_apply_host_overrides_to_separate_endpoints_without_changing_cache() {
+        let mut config = Config::default();
+        config.docker.address_host_override = Some("127.0.0.1".into());
+        let cache = Arc::new(MasternodeCache::new(config.clone()));
+        *cache.data.write().unwrap() = Some(snapshot());
+        let result = response(config, cache.clone(), "/masternodes").await;
+        assert_eq!(result["data"][0]["address"], "127.0.0.1:9999");
+        assert_eq!(
+            result["data"][0]["addresses"]["platform_p2p"],
+            json!(["127.0.0.1:27656"])
+        );
+        assert_eq!(
+            result["data"][0]["addresses"]["platform_https"],
+            json!(["127.0.0.1:1443"])
+        );
+        assert_eq!(
+            cache.get_snapshot().await.unwrap().masternodes[0].address,
+            "192.0.2.1:9999"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_omit_freshness_when_cache_is_empty_and_on_other_endpoints() {
+        let config = Config::default();
+        let cache = Arc::new(MasternodeCache::new(config.clone()));
+        let result = response(config.clone(), cache.clone(), "/masternodes").await;
+        assert_eq!(result["success"], false);
+        assert!(result.get("lastUpdated").is_none());
+        let health = response(config, cache, "/health").await;
+        assert_eq!(health["success"], true);
+        assert!(health.get("lastUpdated").is_none());
     }
 }
