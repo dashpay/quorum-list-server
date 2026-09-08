@@ -1,4 +1,5 @@
 mod api;
+mod proofs;
 mod config;
 mod quorum_list;
 mod quorum_loader;

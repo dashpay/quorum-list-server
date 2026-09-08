@@ -220,3 +220,30 @@ rpcpassword=password
 rpcallowip=127.0.0.1
 testnet=1
 ```
+
+### Verified snapshot proofs
+
+`POST /proofs` forwards compact Core bootstrap evidence as binary
+`application/octet-stream`, with the same API as DAPI. Configure the existing RPC
+connection to a Core build supporting `getquorumproofchain`, running unpruned with
+`-quorumproofindex`. Enabling that index scans historical blocks at startup.
+
+```json
+{"checkpoint":"<release checkpoint block hash>","height":1549547,"quorumHash":"<Platform quorum hash>","llmqType":6,"nodeCount":4}
+```
+
+Hashes use RPC display order. `height` is a minimum target height; zero selects
+Core's latest archived ChainLock. Mainnet uses Platform quorum type 4, testnet 6.
+`nodeCount` is 0–15. Success contains a `DASHNC02` proof and authenticated quorum
+and EvoNode record openings, not JSON keys to trust. Clients verify it against
+an independently pinned snapshot. Gzip is supported; clients must enforce the
+1 MiB decoded response limit.
+
+The relay limits request bodies to 1 KiB, concurrent Core workers to two, and
+cached proof payloads to 16 MiB / 64 entries for 15 seconds. Invalid requests
+return 400 (or 422 for invalid JSON schema), oversized bodies 413, saturated
+workers 503, upstream failures 502, and timeouts 504. Blocking RPC workers retain
+their permits after an HTTP timeout until the underlying call ends.
+
+Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
+for explicitly trusted clients. This branch does not deploy the service.
