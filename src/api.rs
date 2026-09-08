@@ -106,6 +106,7 @@ impl From<&QuorumListEntry> for QuorumEntryResponse {
 
 
 pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode_cache: SharedMasternodeCache) -> Router {
+    let proof_router = crate::proofs::router(config.clone());
     let shared_config = Arc::new(config);
     Router::new()
         .route("/health", get(health_check))
@@ -115,6 +116,7 @@ pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode
         .route("/quorums/:hash", get(get_quorum_by_hash))
         .route("/masternodes", get(get_masternodes))
         .with_state((quorum_cache, shared_config, masternode_cache))
+        .merge(proof_router)
         .layer(CorsLayer::permissive())
         // Responses are highly repetitive JSON; /masternodes is ~67 KB uncompressed.
         .layer(CompressionLayer::new())
