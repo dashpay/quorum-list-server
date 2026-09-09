@@ -7,7 +7,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use dashcore_rpc::{Auth, Client, RpcApi};
+use dashcore_rpc::{jsonrpc, Client, RpcApi};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -19,6 +19,7 @@ use tokio::sync::Semaphore;
 const MAX_PROOF: usize = 1_048_576;
 const CACHE_BYTES: usize = 16 * MAX_PROOF;
 const TTL: Duration = Duration::from_secs(15);
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,13 +112,18 @@ impl ProofRelay {
         let task = tokio::task::spawn_blocking(move || {
             // Keep capacity occupied until the blocking RPC ends, including after timeout.
             let _permit = permit;
-            let client = Client::new(
-                &config.rpc.url,
-                Auth::UserPass(config.rpc.username.clone(), config.rpc.password.clone()),
-            )?;
+            // The transport defaults to 15 seconds, shorter than cold historical
+            // proof generation. Match the outer deadline instead.
+            let transport = jsonrpc::simple_http::Builder::new()
+                .url(&config.rpc.url)
+                .map_err(|e| dashcore_rpc::Error::JsonRpc(e.into()))?
+                .auth(&config.rpc.username, Some(&config.rpc.password))
+                .timeout(RPC_TIMEOUT)
+                .build();
+            let client = Client::from_jsonrpc(jsonrpc::Client::with_transport(transport));
             client.call::<serde_json::Value>("getquorumproofchain", &params)
         });
-        let value = tokio::time::timeout(Duration::from_secs(60), task)
+        let value = tokio::time::timeout(RPC_TIMEOUT, task)
             .await
             .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
             .map_err(|_| StatusCode::BAD_GATEWAY)?

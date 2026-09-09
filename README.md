@@ -234,7 +234,7 @@ index or startup scan is required. An unpruned node can serve older checkpoints.
 ```
 
 Hashes use RPC display order. `height` is a minimum target height; zero selects
-Core's latest archived ChainLock. Mainnet uses Platform quorum type 4, testnet 6.
+Core's latest available ChainLock. Mainnet uses Platform quorum type 4, testnet 6.
 `nodeCount` is 0–15. Success contains a `DASHNC02` proof and authenticated quorum
 and EvoNode record openings, not JSON keys to trust. Clients verify it against
 an independently pinned snapshot. Gzip is supported; clients must enforce the
@@ -244,7 +244,10 @@ The relay limits request bodies to 1 KiB, concurrent Core workers to two, and
 cached proof payloads to 16 MiB / 64 entries for 15 seconds. Invalid requests
 return 400 (or 422 for invalid JSON schema), oversized bodies 413, saturated
 workers 503, upstream failures 502, and timeouts 504. Blocking RPC workers retain
-their permits after an HTTP timeout until the underlying call ends.
+their permits after an HTTP timeout until the underlying call ends. Both the
+Core HTTP transport and the relay deadline allow 60 seconds for cold historical
+proof generation. Clients should allow additional time for response delivery
+(the SDK uses 65 seconds).
 
 Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
 for explicitly trusted clients. This branch does not deploy the service.
