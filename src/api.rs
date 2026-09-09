@@ -24,6 +24,8 @@ pub struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub message: Option<String>,
+    #[serde(rename = "lastUpdated", skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<i64>,
 }
 
 impl<T> ApiResponse<T> {
@@ -32,6 +34,7 @@ impl<T> ApiResponse<T> {
             success: true,
             data: Some(data),
             message: None,
+            last_updated: None,
         }
     }
 
@@ -40,6 +43,7 @@ impl<T> ApiResponse<T> {
             success: false,
             data: None,
             message: Some(message),
+            last_updated: None,
         }
     }
 }
@@ -184,21 +188,37 @@ async fn get_previous_quorums(
 
 #[axum::debug_handler]
 async fn get_masternodes(
-    State((_, config, masternode_cache)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
+    State((_, config, masternode_cache)): State<(
+        SharedQuorumCache,
+        SharedConfig,
+        SharedMasternodeCache,
+    )>,
 ) -> Result<Json<ApiResponse<EvoMasternodeList>>, StatusCode> {
-    match masternode_cache.get_masternodes().await {
-        Ok(masternodes) => {
+    match masternode_cache.get_snapshot().await {
+        Ok(snapshot) => {
             // Apply address host override if configured
-            let masternodes: EvoMasternodeList = masternodes
+            let masternodes: EvoMasternodeList = snapshot
+                .masternodes
                 .into_iter()
                 .map(|mut m| {
                     m.address = config.apply_address_host_override(&m.address);
+                    if let Some(addresses) = &mut m.addresses {
+                        for endpoints in addresses.values_mut() {
+                            for endpoint in endpoints {
+                                *endpoint = config.apply_address_host_override(endpoint);
+                            }
+                        }
+                    }
                     m
                 })
                 .collect();
-            Ok(Json(ApiResponse::success(masternodes)))
+            let mut response = ApiResponse::success(masternodes);
+            response.last_updated = Some(snapshot.last_updated);
+            Ok(Json(response))
         }
-        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load masternodes: {}", e))))
+        Err(e) => Ok(Json(ApiResponse::error(format!(
+            "Failed to load masternodes: {}",
+            e
+        )))),
     }
 }
-
