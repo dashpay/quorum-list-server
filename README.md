@@ -225,8 +225,9 @@ testnet=1
 
 `POST /proofs` forwards compact Core bootstrap evidence as binary
 `application/octet-stream`, with the same API as DAPI. Configure the existing RPC
-connection to a Core build supporting `getquorumproofchain`, running unpruned with
-`-quorumproofindex`. Enabling that index scans historical blocks at startup.
+connection to a Core build supporting `getquorumproofchain` with the required
+historical blocks retained. Core reads evidence from disk on demand; no extra
+index or startup scan is required. An unpruned node can serve older checkpoints.
 
 ```json
 {"checkpoint":"<release checkpoint block hash>","height":1549547,"quorumHash":"<Platform quorum hash>","llmqType":6,"nodeCount":4}
