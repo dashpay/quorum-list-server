@@ -85,6 +85,18 @@ fn fail(status: StatusCode, cause: Arguments<'_>) -> StatusCode {
     eprintln!("proofs: {status} <- {cause}");
     status
 }
+/// hyper's transport errors display only a category ("client error (Connect)");
+/// the operator-relevant cause such as "connection refused" sits in the chain.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        next = cause.source();
+    }
+    text
+}
 fn decode_response(value: &serde_json::Value) -> Result<Vec<u8>, StatusCode> {
     let hex = value
         .get("bootstrap_hex")
@@ -110,7 +122,11 @@ async fn serve(State(relay): State<ProofRelay>, Json(request): Json<ProofRequest
     }
 }
 impl ProofRelay {
-    fn new(config: Config, deadline: Duration) -> Self {
+    fn new(mut config: Config, deadline: Duration) -> Self {
+        // The other RPC clients accept a bare host:port; hyper needs a scheme.
+        if !config.rpc.url.contains("://") {
+            config.rpc.url = format!("http://{}", config.rpc.url);
+        }
         Self {
             config: Arc::new(config),
             client: Client::builder(TokioExecutor::new()).build_http(),
@@ -139,11 +155,12 @@ impl ProofRelay {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(body.to_string())))
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("RPC request: {e}")))?;
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("RPC transport: {e}")))?;
+        let response = self.client.request(request).await.map_err(|e| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                format_args!("RPC transport: {}", chain(&e)),
+            )
+        })?;
         let status = response.status();
         let body = Limited::new(response.into_body(), MAX_UPSTREAM)
             .collect()
@@ -158,10 +175,17 @@ impl ProofRelay {
         let mut envelope: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("RPC {status}: {e}")))?;
         if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
-            let error: String = error.to_string().chars().take(200).collect();
+            let code = error.get("code").and_then(serde_json::Value::as_i64);
+            let message: String = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect();
             return Err(fail(
                 StatusCode::BAD_GATEWAY,
-                format_args!("RPC {status}: {error}"),
+                format_args!("RPC {status}: error {code:?} {message}"),
             ));
         }
         envelope
@@ -363,20 +387,30 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_upstream_bodies_are_cut_off_at_the_socket() {
-        let addr = raw_server(|mut stream| async move {
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                MAX_UPSTREAM * 4
-            );
-            let _ = stream.write_all(head.as_bytes()).await;
-            let chunk = vec![b' '; 65_536];
-            // Stops once the relay drops the connection at the limit.
-            while stream.write_all(&chunk).await.is_ok() {}
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let addr = raw_server(move |mut stream| {
+            let counter = counter.clone();
+            async move {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    MAX_UPSTREAM * 4
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let chunk = vec![b' '; 65_536];
+                // Stops once the relay drops the connection at the limit.
+                while stream.write_all(&chunk).await.is_ok() {
+                    counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                }
+            }
         })
         .await;
         let relay = relay_for(addr, Duration::from_secs(10));
         assert_eq!(relay.proof(request()).await, Err(StatusCode::BAD_GATEWAY));
         assert_eq!(relay.workers.available_permits(), 2);
+        // Kernel socket buffers absorb a little past the limit, never the 16 MiB.
+        assert!(written.load(Ordering::SeqCst) < 3 * MAX_UPSTREAM);
     }
 
     #[tokio::test]
@@ -407,14 +441,19 @@ mod tests {
             drop(stream);
         })
         .await;
-        let relay = relay_for(addr, Duration::from_millis(300));
+        let relay = relay_for(addr, Duration::from_secs(2));
         let slow = (0..2)
             .map(|_| {
                 let relay = relay.clone();
                 tokio::spawn(async move { relay.proof(request()).await })
             })
             .collect::<Vec<_>>();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if relay.workers.available_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(relay.workers.available_permits(), 0);
         assert_eq!(
             relay.proof(request()).await,
@@ -424,6 +463,18 @@ mod tests {
             assert_eq!(task.await.unwrap(), Err(StatusCode::GATEWAY_TIMEOUT));
         }
         assert_eq!(relay.workers.available_permits(), 2);
+    }
+
+    #[test]
+    fn bare_host_port_rpc_urls_get_a_scheme() {
+        let mut config = Config::default();
+        config.rpc.url = "127.0.0.1:19998".into();
+        let relay = ProofRelay::new(config, RPC_TIMEOUT);
+        assert_eq!(relay.config.rpc.url, "http://127.0.0.1:19998");
+        config = Config::default();
+        config.rpc.url = "https://core.example:9998".into();
+        let relay = ProofRelay::new(config, RPC_TIMEOUT);
+        assert_eq!(relay.config.rpc.url, "https://core.example:9998");
     }
 
     #[test]
