@@ -248,9 +248,13 @@ at the socket above roughly 4 MiB before they are buffered or parsed. Each Core
 call runs detached from the public connection: identical concurrent requests
 share one call, a client that disconnects does not free the worker early, and
 the result is cached for later callers. One 60-second deadline covers the whole
-Core round trip; hitting it drops the Core connection, but because Core finishes
-an already-dispatched proof anyway, the worker stays reserved for a further
-60 seconds so the relay never submits faster than Core can complete. Clients
+Core round trip; hitting it drops the Core connection. Core finishes an
+already-dispatched proof anyway, so a worker whose call was abandoned after Core
+started work (deadline, dropped connection, cut-off body) stays reserved for a
+further 120 seconds. This bounds how fast the relay re-dispatches abandoned work,
+roughly one call per three minutes per worker; it is a rate limit, not a
+guarantee that Core has finished, since very long historical spans can outlast
+it. Fast failures release the worker immediately. Clients
 should allow additional time for response delivery (the SDK uses 65 seconds).
 Failure causes are logged to stderr without credentials or response bodies;
 every public error response, including malformed JSON, is an empty status code.

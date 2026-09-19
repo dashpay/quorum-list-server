@@ -39,9 +39,15 @@ const TTL: Duration = Duration::from_secs(15);
 /// the connection, so a slow, hung, or truncating upstream cannot pin a worker.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Core runs a dispatched `getquorumproofchain` to completion even after its
-/// HTTP client is gone, so a worker that hit the deadline stays reserved this
-/// much longer before the relay submits more work to Core.
-const COOLDOWN: Duration = Duration::from_secs(60);
+/// HTTP client is gone. A worker whose call was abandoned after Core plausibly
+/// started work (deadline, dropped connection, cut-off body) stays reserved
+/// this much longer, so the relay re-dispatches no faster than roughly one
+/// call per deadline + cooldown per worker. Very long historical builds can
+/// still outlast this; it bounds the rate, it is not a completion guarantee.
+const COOLDOWN: Duration = Duration::from_secs(120);
+/// Failures faster than this (connection refused, Core parameter errors) did
+/// not leave work behind in Core, so the worker is released immediately.
+const FAST_FAILURE: Duration = Duration::from_secs(2);
 
 type Inflight = Shared<BoxFuture<'static, Result<Bytes, StatusCode>>>;
 
@@ -72,6 +78,17 @@ impl ProofRequest {
             self.llmq_type.into(),
             self.node_count.into(),
         ]
+    }
+}
+struct InflightGuard {
+    map: Arc<Mutex<HashMap<ProofRequest, Inflight>>>,
+    key: ProofRequest,
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.map.lock() {
+            map.remove(&self.key);
+        }
     }
 }
 struct CachedProof {
@@ -250,34 +267,47 @@ impl ProofRelay {
         });
     }
     /// Runs detached from any public connection: the worker permit is released
-    /// only when Core has answered or, after the deadline, once the cooldown
-    /// has passed. Waiters get the result as soon as it exists.
+    /// only when Core has answered or, for a call abandoned after Core started
+    /// work, once the cooldown has passed. Waiters get the result as soon as it
+    /// exists.
     async fn build(
         self,
         request: ProofRequest,
         permit: OwnedSemaphorePermit,
     ) -> Result<Bytes, StatusCode> {
-        let result = match tokio::time::timeout(self.deadline, self.fetch(request.params())).await {
-            Ok(value) => value
-                .and_then(|value| decode_response(&value))
-                .map(Bytes::from),
-            Err(_) => {
+        // Removed on every exit, including panics, so a key can never be stuck
+        // on a stale result.
+        let _inflight = InflightGuard {
+            map: self.inflight.clone(),
+            key: request.clone(),
+        };
+        let started = Instant::now();
+        let (result, timed_out) =
+            match tokio::time::timeout(self.deadline, self.fetch(request.params())).await {
+                Ok(value) => (
+                    value
+                        .and_then(|value| decode_response(&value))
+                        .map(Bytes::from),
+                    false,
+                ),
+                Err(_) => (
+                    Err(fail(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format_args!("RPC exceeded {:?}", self.deadline),
+                    )),
+                    true,
+                ),
+            };
+        match &result {
+            Ok(bytes) => self.store(request, bytes.clone()),
+            Err(_) if timed_out || started.elapsed() >= FAST_FAILURE => {
                 let cooldown = self.cooldown;
                 tokio::spawn(async move {
                     let _permit = permit;
                     tokio::time::sleep(cooldown).await;
                 });
-                Err(fail(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format_args!("RPC exceeded {:?}", self.deadline),
-                ))
             }
-        };
-        if let Ok(bytes) = &result {
-            self.store(request.clone(), bytes.clone());
-        }
-        if let Ok(mut inflight) = self.inflight.lock() {
-            inflight.remove(&request);
+            Err(_) => {}
         }
         result
     }
@@ -296,7 +326,16 @@ impl ProofRelay {
             match inflight.get(&request) {
                 // Identical requests share one Core call and one worker.
                 Some(existing) => existing.clone(),
+                // A build may have stored and retired between the cache probe
+                // above and taking this lock; re-check before spending a worker.
+                None if self.cached(&request)?.is_some() => {
+                    return self
+                        .cached(&request)?
+                        .ok_or(StatusCode::INTERNAL_SERVER_ERROR);
+                }
                 None => {
+                    // Spawning under the lock guarantees the entry is inserted
+                    // before the task can try to remove it.
                     let permit = self
                         .workers
                         .clone()
@@ -537,7 +576,7 @@ mod tests {
         })
         .await;
         let deadline = Duration::from_millis(300);
-        let cooldown = Duration::from_millis(600);
+        let cooldown = Duration::from_millis(900);
         let relay = relay_for(addr, deadline, cooldown);
         let started = Instant::now();
         let slow = [1, 2].map(|height| {
@@ -561,15 +600,16 @@ mod tests {
         for task in slow {
             assert_eq!(task.await.unwrap(), Err(StatusCode::GATEWAY_TIMEOUT));
         }
+        let reserved = relay.workers.available_permits();
         // Both upstream sockets were closed at the deadline, not at the cooldown.
         for _ in 0..2 {
             let closed = tokio::time::timeout(Duration::from_secs(1), eof_rx.recv())
                 .await
                 .expect("upstream never saw EOF")
                 .unwrap();
-            assert!(closed - started < deadline + Duration::from_millis(200));
+            assert!(closed - started < deadline + cooldown / 2);
         }
-        assert_eq!(relay.workers.available_permits(), 0);
+        assert_eq!(reserved, 0);
         assert!(relay.inflight.lock().unwrap().is_empty());
         wait_until(|| relay.workers.available_permits() == 2).await;
         assert!(started.elapsed() >= deadline + cooldown);
@@ -582,7 +622,7 @@ mod tests {
         let addr = raw_server(move |mut stream| {
             counter.fetch_add(1, Ordering::SeqCst);
             async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = stream.write_all(rpc_ok().as_bytes()).await;
             }
         })
@@ -603,6 +643,66 @@ mod tests {
         // The abandoned result was still cached, so nobody pays for it twice.
         assert_eq!(relay.proof(request()).await.unwrap().as_ref(), FIXTURE);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn two_disconnected_clients_cannot_admit_a_third_core_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let addr = raw_server(move |mut stream| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = stream.write_all(rpc_ok().as_bytes()).await;
+            }
+        })
+        .await;
+        let relay = relay_for(addr, Duration::from_secs(5), Duration::ZERO);
+        let handlers = [1, 2].map(|height| {
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                relay
+                    .proof(ProofRequest {
+                        height,
+                        ..request()
+                    })
+                    .await
+            })
+        });
+        wait_until(|| relay.workers.available_permits() == 0).await;
+        for handler in &handlers {
+            handler.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            relay
+                .proof(ProofRequest {
+                    height: 3,
+                    ..request()
+                })
+                .await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        wait_until(|| relay.workers.available_permits() == 2).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_upstream_connection_after_work_started_reserves_the_worker() {
+        let addr = raw_server(|mut stream| async move {
+            // Core "started" (past FAST_FAILURE), then the connection dies.
+            tokio::time::sleep(FAST_FAILURE + Duration::from_millis(100)).await;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n").await;
+        })
+        .await;
+        let cooldown = Duration::from_millis(700);
+        let relay = relay_for(addr, Duration::from_secs(10), cooldown);
+        let started = Instant::now();
+        assert_eq!(relay.proof(request()).await, Err(StatusCode::BAD_GATEWAY));
+        assert_eq!(relay.workers.available_permits(), 1);
+        assert!(relay.inflight.lock().unwrap().is_empty());
+        wait_until(|| relay.workers.available_permits() == 2).await;
+        assert!(started.elapsed() >= FAST_FAILURE + cooldown);
     }
 
     #[tokio::test]
