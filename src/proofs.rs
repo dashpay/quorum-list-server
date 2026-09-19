@@ -115,6 +115,9 @@ fn fail(status: StatusCode, cause: Arguments<'_>) -> StatusCode {
     eprintln!("proofs: {status} <- {cause}");
     status
 }
+macro_rules! bad_gateway {
+    ($($arg:tt)*) => { fail(StatusCode::BAD_GATEWAY, format_args!($($arg)*)) };
+}
 /// hyper's transport errors display only a category ("client error (Connect)");
 /// the operator-relevant cause such as "connection refused" sits in the chain.
 fn chain(error: &dyn std::error::Error) -> String {
@@ -131,19 +134,11 @@ fn decode_response(value: &serde_json::Value) -> Result<Vec<u8>, StatusCode> {
     let hex = value
         .get("bootstrap_hex")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            fail(
-                StatusCode::BAD_GATEWAY,
-                format_args!("missing bootstrap_hex"),
-            )
-        })?;
+        .ok_or_else(|| bad_gateway!("missing bootstrap_hex"))?;
     if hex.is_empty() || hex.len() > MAX_PROOF * 2 {
-        return Err(fail(
-            StatusCode::BAD_GATEWAY,
-            format_args!("bootstrap_hex length {}", hex.len()),
-        ));
+        return Err(bad_gateway!("bootstrap_hex length {}", hex.len(),));
     }
-    hex::decode(hex).map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("bootstrap_hex: {e}")))
+    hex::decode(hex).map_err(|e| bad_gateway!("bootstrap_hex: {e}"))
 }
 async fn serve(
     State(relay): State<ProofRelay>,
@@ -194,26 +189,20 @@ impl ProofRelay {
             .header(header::AUTHORIZATION, format!("Basic {auth}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(body.to_string())))
-            .map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("RPC request: {e}")))?;
-        let response = self.client.request(request).await.map_err(|e| {
-            fail(
-                StatusCode::BAD_GATEWAY,
-                format_args!("RPC transport: {}", chain(&e)),
-            )
-        })?;
+            .map_err(|e| bad_gateway!("RPC request: {e}"))?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|e| bad_gateway!("RPC transport: {}", chain(&e),))?;
         let status = response.status();
         let body = Limited::new(response.into_body(), MAX_UPSTREAM)
             .collect()
             .await
-            .map_err(|e| {
-                fail(
-                    StatusCode::BAD_GATEWAY,
-                    format_args!("RPC {status} body: {e}"),
-                )
-            })?
+            .map_err(|e| bad_gateway!("RPC {status} body: {e}"))?
             .to_bytes();
-        let mut envelope: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| fail(StatusCode::BAD_GATEWAY, format_args!("RPC {status}: {e}")))?;
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| bad_gateway!("RPC {status}: {e}"))?;
         if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
             let code = error.get("code").and_then(serde_json::Value::as_i64);
             let message: String = error
@@ -223,20 +212,12 @@ impl ProofRelay {
                 .chars()
                 .take(200)
                 .collect();
-            return Err(fail(
-                StatusCode::BAD_GATEWAY,
-                format_args!("RPC {status}: error {code:?} {message}"),
-            ));
+            return Err(bad_gateway!("RPC {status}: error {code:?} {message}"));
         }
         envelope
             .get_mut("result")
             .map(serde_json::Value::take)
-            .ok_or_else(|| {
-                fail(
-                    StatusCode::BAD_GATEWAY,
-                    format_args!("RPC {status}: no result"),
-                )
-            })
+            .ok_or_else(|| bad_gateway!("RPC {status}: no result"))
     }
     fn cached(&self, request: &ProofRequest) -> Result<Option<Bytes>, StatusCode> {
         let mut cache = self
@@ -282,34 +263,34 @@ impl ProofRelay {
             key: request.clone(),
         };
         let started = Instant::now();
-        let (result, timed_out) =
-            match tokio::time::timeout(self.deadline, self.fetch(request.params())).await {
-                Ok(value) => (
-                    value
-                        .and_then(|value| decode_response(&value))
-                        .map(Bytes::from),
-                    false,
-                ),
-                Err(_) => (
-                    Err(fail(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        format_args!("RPC exceeded {:?}", self.deadline),
-                    )),
-                    true,
-                ),
-            };
-        match &result {
-            Ok(bytes) => self.store(request, bytes.clone()),
-            Err(_) if timed_out || started.elapsed() >= FAST_FAILURE => {
-                let cooldown = self.cooldown;
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    tokio::time::sleep(cooldown).await;
-                });
+        let fetched = tokio::time::timeout(self.deadline, self.fetch(request.params())).await;
+        let timed_out = fetched.is_err();
+        let result = match fetched {
+            Ok(value) => value
+                .and_then(|value| decode_response(&value))
+                .map(Bytes::from),
+            Err(_) => Err(fail(
+                StatusCode::GATEWAY_TIMEOUT,
+                format_args!("RPC exceeded {:?}", self.deadline),
+            )),
+        };
+        match result {
+            Ok(bytes) => {
+                self.store(request, bytes.clone());
+                Ok(bytes)
             }
-            Err(_) => {}
+            Err(status) => {
+                let core_may_still_be_working = timed_out || started.elapsed() >= FAST_FAILURE;
+                if core_may_still_be_working {
+                    let cooldown = self.cooldown;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        tokio::time::sleep(cooldown).await;
+                    });
+                }
+                Err(status)
+            }
         }
-        result
     }
     async fn proof(&self, request: ProofRequest) -> Result<Bytes, StatusCode> {
         if !request.valid() {
@@ -323,31 +304,26 @@ impl ProofRelay {
                 .inflight
                 .lock()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            match inflight.get(&request) {
+            if let Some(existing) = inflight.get(&request) {
                 // Identical requests share one Core call and one worker.
-                Some(existing) => existing.clone(),
-                // A build may have stored and retired between the cache probe
-                // above and taking this lock; re-check before spending a worker.
-                None if self.cached(&request)?.is_some() => {
-                    return self
-                        .cached(&request)?
-                        .ok_or(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-                None => {
-                    // Spawning under the lock guarantees the entry is inserted
-                    // before the task can try to remove it.
-                    let permit = self
-                        .workers
-                        .clone()
-                        .try_acquire_owned()
-                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                    let task = tokio::spawn(self.clone().build(request.clone(), permit));
-                    let shared = async move { task.await.unwrap_or(Err(StatusCode::BAD_GATEWAY)) }
-                        .boxed()
-                        .shared();
-                    inflight.insert(request, shared.clone());
-                    shared
-                }
+                existing.clone()
+            } else if let Some(bytes) = self.cached(&request)? {
+                // A build stored and retired between the probe above and this lock.
+                return Ok(bytes);
+            } else {
+                let permit = self
+                    .workers
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                // Spawning under the lock guarantees the entry is inserted
+                // before the task can try to remove it.
+                let task = tokio::spawn(self.clone().build(request.clone(), permit));
+                let shared = async move { task.await.unwrap_or(Err(StatusCode::BAD_GATEWAY)) }
+                    .boxed()
+                    .shared();
+                inflight.insert(request, shared.clone());
+                shared
             }
         };
         inflight.await
@@ -356,36 +332,61 @@ impl ProofRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{HeaderMap, Request},
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    use tower::Service;
 
     const FIXTURE: &[u8] = include_bytes!("../tests/data/bootstrap.bin");
 
     fn request() -> ProofRequest {
+        request_at(1)
+    }
+    fn request_at(height: u32) -> ProofRequest {
         ProofRequest {
             checkpoint: "ab".repeat(32),
-            height: 1,
+            height,
             quorum_hash: "cd".repeat(32),
             llmq_type: 6,
             node_count: 4,
         }
     }
-    fn relay_for(addr: std::net::SocketAddr, deadline: Duration, cooldown: Duration) -> ProofRelay {
+    fn config_for(url: &str) -> Config {
         let mut config = Config::default();
-        config.rpc.url = format!("http://{addr}");
-        ProofRelay::new(config, deadline, cooldown)
+        config.rpc.url = url.to_string();
+        config
     }
-    fn rpc_ok() -> String {
+    fn relay_for(addr: std::net::SocketAddr, deadline: Duration, cooldown: Duration) -> ProofRelay {
+        ProofRelay::new(config_for(&format!("http://{addr}")), deadline, cooldown)
+    }
+    fn rpc_ok() -> Vec<u8> {
         let body = serde_json::json!({"result":{"bootstrap_hex":hex::encode(FIXTURE)},"error":null,"id":"proofs"})
             .to_string();
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+        .into_bytes()
+    }
+    /// Upstream that counts connections and answers `rpc_ok` after `delay`.
+    async fn slow_ok_server(delay: Duration) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let addr = raw_server(move |mut stream| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(&rpc_ok()).await;
+            }
+        })
+        .await;
+        (addr, calls)
     }
     /// Raw HTTP server that runs `respond` on every connection once the request
     /// headers arrive, so malformed upstream behaviour can be scripted exactly.
@@ -428,11 +429,6 @@ mod tests {
 
     #[tokio::test]
     async fn serves_core_bytes_and_caches_without_refetching() {
-        use axum::{
-            body::{to_bytes, Body},
-            http::Request,
-        };
-        use tower::Service;
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let rpc = Router::new().route(
@@ -451,8 +447,7 @@ mod tests {
             ),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = Config::default();
-        config.rpc.url = format!("http://{}", listener.local_addr().unwrap());
+        let config = config_for(&format!("http://{}", listener.local_addr().unwrap()));
         let task = tokio::spawn(async move {
             axum::serve(listener, rpc).await.unwrap();
         });
@@ -581,20 +576,12 @@ mod tests {
         let started = Instant::now();
         let slow = [1, 2].map(|height| {
             let relay = relay.clone();
-            let request = ProofRequest {
-                height,
-                ..request()
-            };
+            let request = request_at(height);
             tokio::spawn(async move { relay.proof(request).await })
         });
         wait_until(|| relay.workers.available_permits() == 0).await;
         assert_eq!(
-            relay
-                .proof(ProofRequest {
-                    height: 3,
-                    ..request()
-                })
-                .await,
+            relay.proof(request_at(3)).await,
             Err(StatusCode::SERVICE_UNAVAILABLE)
         );
         for task in slow {
@@ -617,16 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_disconnect_keeps_the_worker_until_core_answers() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let addr = raw_server(move |mut stream| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = stream.write_all(rpc_ok().as_bytes()).await;
-            }
-        })
-        .await;
+        let (addr, calls) = slow_ok_server(Duration::from_secs(1)).await;
         let relay = relay_for(addr, Duration::from_secs(5), Duration::ZERO);
         let handler = {
             let relay = relay.clone();
@@ -647,27 +625,11 @@ mod tests {
 
     #[tokio::test]
     async fn two_disconnected_clients_cannot_admit_a_third_core_call() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let addr = raw_server(move |mut stream| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let _ = stream.write_all(rpc_ok().as_bytes()).await;
-            }
-        })
-        .await;
+        let (addr, calls) = slow_ok_server(Duration::from_secs(1)).await;
         let relay = relay_for(addr, Duration::from_secs(5), Duration::ZERO);
         let handlers = [1, 2].map(|height| {
             let relay = relay.clone();
-            tokio::spawn(async move {
-                relay
-                    .proof(ProofRequest {
-                        height,
-                        ..request()
-                    })
-                    .await
-            })
+            tokio::spawn(async move { relay.proof(request_at(height)).await })
         });
         wait_until(|| relay.workers.available_permits() == 0).await;
         for handler in &handlers {
@@ -675,12 +637,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            relay
-                .proof(ProofRequest {
-                    height: 3,
-                    ..request()
-                })
-                .await,
+            relay.proof(request_at(3)).await,
             Err(StatusCode::SERVICE_UNAVAILABLE)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -707,16 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn identical_concurrent_requests_share_one_core_call() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let addr = raw_server(move |mut stream| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                let _ = stream.write_all(rpc_ok().as_bytes()).await;
-            }
-        })
-        .await;
+        let (addr, calls) = slow_ok_server(Duration::from_millis(200)).await;
         let relay = relay_for(addr, Duration::from_secs(5), Duration::ZERO);
         let waiters = (0..3)
             .map(|_| {
@@ -735,23 +683,14 @@ mod tests {
     #[test]
     fn cache_expires_isolates_keys_and_bounds_entries_and_bytes() {
         let relay = ProofRelay::new(Config::default(), RPC_TIMEOUT, COOLDOWN);
-        let other = ProofRequest {
-            height: 2,
-            ..request()
-        };
+        let other = request_at(2);
         relay.store(request(), Bytes::from_static(b"aa"));
         assert_eq!(relay.cached(&request()).unwrap().unwrap().as_ref(), b"aa");
         assert!(relay.cached(&other).unwrap().is_none());
         relay.cache.lock().unwrap()[0].inserted = Instant::now().checked_sub(TTL).unwrap();
         assert!(relay.cached(&request()).unwrap().is_none());
         for height in 0..CACHE_ENTRIES as u32 + 1 {
-            relay.store(
-                ProofRequest {
-                    height,
-                    ..request()
-                },
-                Bytes::from_static(b"x"),
-            );
+            relay.store(request_at(height), Bytes::from_static(b"x"));
         }
         let cache = relay.cache.lock().unwrap();
         assert_eq!(cache.len(), CACHE_ENTRIES);
@@ -769,14 +708,18 @@ mod tests {
 
     #[test]
     fn bare_host_port_rpc_urls_get_a_scheme() {
-        let mut config = Config::default();
-        config.rpc.url = "127.0.0.1:19998".into();
-        let relay = ProofRelay::new(config, RPC_TIMEOUT, COOLDOWN);
-        assert_eq!(relay.config.rpc.url, "http://127.0.0.1:19998");
-        config = Config::default();
-        config.rpc.url = "https://core.example:9998".into();
-        let relay = ProofRelay::new(config, RPC_TIMEOUT, COOLDOWN);
-        assert_eq!(relay.config.rpc.url, "https://core.example:9998");
+        let relay_url = |url| {
+            ProofRelay::new(config_for(url), RPC_TIMEOUT, COOLDOWN)
+                .config
+                .rpc
+                .url
+                .clone()
+        };
+        assert_eq!(relay_url("127.0.0.1:19998"), "http://127.0.0.1:19998");
+        assert_eq!(
+            relay_url("https://core.example:9998"),
+            "https://core.example:9998"
+        );
     }
 
     #[test]
