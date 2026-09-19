@@ -244,13 +244,16 @@ The relay limits request bodies to 1 KiB, concurrent Core workers to two, and
 cached proof payloads to 16 MiB / 64 entries for 15 seconds. Invalid requests
 return 400 (or 422 for invalid JSON schema), oversized bodies 413, saturated
 workers 503, upstream failures 502, and timeouts 504. Core responses are cut off
-at the socket above roughly 4 MiB before they are buffered or parsed. One
-60-second deadline covers the whole Core round trip; hitting it drops the Core
-connection and frees the worker, so a hung or truncating upstream cannot pin
-capacity. Cold historical proof generation fits inside that deadline. Clients
+at the socket above roughly 4 MiB before they are buffered or parsed. Each Core
+call runs detached from the public connection: identical concurrent requests
+share one call, a client that disconnects does not free the worker early, and
+the result is cached for later callers. One 60-second deadline covers the whole
+Core round trip; hitting it drops the Core connection, but because Core finishes
+an already-dispatched proof anyway, the worker stays reserved for a further
+60 seconds so the relay never submits faster than Core can complete. Clients
 should allow additional time for response delivery (the SDK uses 65 seconds).
 Failure causes are logged to stderr without credentials or response bodies;
-the public error responses stay empty.
+every public error response, including malformed JSON, is an empty status code.
 
 Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
 for explicitly trusted clients. This branch does not deploy the service.
