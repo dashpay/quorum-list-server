@@ -243,11 +243,14 @@ an independently pinned snapshot. Gzip is supported; clients must enforce the
 The relay limits request bodies to 1 KiB, concurrent Core workers to two, and
 cached proof payloads to 16 MiB / 64 entries for 15 seconds. Invalid requests
 return 400 (or 422 for invalid JSON schema), oversized bodies 413, saturated
-workers 503, upstream failures 502, and timeouts 504. Blocking RPC workers retain
-their permits after an HTTP timeout until the underlying call ends. Both the
-Core HTTP transport and the relay deadline allow 60 seconds for cold historical
-proof generation. Clients should allow additional time for response delivery
-(the SDK uses 65 seconds).
+workers 503, upstream failures 502, and timeouts 504. Core responses are cut off
+at the socket above roughly 4 MiB before they are buffered or parsed. One
+60-second deadline covers the whole Core round trip; hitting it drops the Core
+connection and frees the worker, so a hung or truncating upstream cannot pin
+capacity. Cold historical proof generation fits inside that deadline. Clients
+should allow additional time for response delivery (the SDK uses 65 seconds).
+Failure causes are logged to stderr without credentials or response bodies;
+the public error responses stay empty.
 
 Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
 for explicitly trusted clients. This branch does not deploy the service.
