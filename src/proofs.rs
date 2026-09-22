@@ -177,6 +177,13 @@ impl ProofRelay {
         if !config.rpc.url.contains("://") {
             config.rpc.url = format!("http://{}", config.rpc.url);
         }
+        // Core's RPC server is plain HTTP and this client has no TLS connector,
+        // so any other scheme could only ever fail per request. Refuse it at
+        // startup instead.
+        assert!(
+            config.rpc.url.starts_with("http://"),
+            "proof relay needs an http:// Core RPC URL (Core RPC has no TLS)"
+        );
         Self {
             config: Arc::new(config),
             client: Client::builder(TokioExecutor::new()).build_http(),
@@ -764,8 +771,18 @@ mod tests {
         };
         assert_eq!(relay_url("127.0.0.1:19998"), "http://127.0.0.1:19998");
         assert_eq!(
-            relay_url("https://core.example:9998"),
-            "https://core.example:9998"
+            relay_url("http://core.example:9998"),
+            "http://core.example:9998"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "needs an http:// Core RPC URL")]
+    fn https_rpc_urls_are_refused_at_startup() {
+        ProofRelay::new(
+            config_for("https://core.example:9998"),
+            RPC_TIMEOUT,
+            COOLDOWN,
         );
     }
 
