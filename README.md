@@ -249,15 +249,17 @@ call runs detached from the public connection: identical concurrent requests
 share one call, a client that disconnects does not free the worker early, and
 the result is cached for later callers. One 60-second deadline covers the whole
 Core round trip; hitting it drops the Core connection. Core finishes an
-already-dispatched proof anyway, so a worker whose call was abandoned after Core
-started work (deadline, dropped connection, cut-off body) stays reserved for a
-further 120 seconds. This bounds how fast the relay re-dispatches abandoned work,
+already-dispatched proof anyway and replies only when it is done, so a worker
+whose call got no reply after Core started work (deadline, or the connection
+lost while waiting) stays reserved for a further 120 seconds. Any reply from
+Core, including an error, releases the worker at once. This bounds how fast the relay re-dispatches abandoned work,
 roughly one call per three minutes per worker; it is a rate limit, not a
 guarantee that Core has finished, since very long historical spans can outlast
 it. Fast failures release the worker immediately. Clients
 should allow additional time for response delivery (the SDK uses 65 seconds).
 Failure causes are logged to stderr without credentials or response bodies;
-every public error response, including malformed JSON, is an empty status code.
+every public error response, including malformed JSON, returns its status code
+with an empty response body.
 
 Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
 for explicitly trusted clients. This branch does not deploy the service.

@@ -39,10 +39,11 @@ const TTL: Duration = Duration::from_secs(15);
 /// the connection, so a slow, hung, or truncating upstream cannot pin a worker.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Core runs a dispatched `getquorumproofchain` to completion even after its
-/// HTTP client is gone. A worker whose call was abandoned after Core plausibly
-/// started work (deadline, dropped connection, cut-off body) stays reserved
-/// this much longer, so the relay re-dispatches no faster than roughly one
-/// call per deadline + cooldown per worker. Very long historical builds can
+/// HTTP client is gone, and only replies once the build has finished. A worker
+/// whose call ended without any reply after Core plausibly started work
+/// (deadline, connection lost while waiting) stays reserved this much longer,
+/// so the relay re-dispatches no faster than roughly one call per
+/// deadline + cooldown per worker. Very long historical builds can
 /// still outlast this; it bounds the rate, it is not a completion guarantee.
 const COOLDOWN: Duration = Duration::from_secs(120);
 /// Failures faster than this (connection refused, Core parameter errors) did
@@ -50,6 +51,22 @@ const COOLDOWN: Duration = Duration::from_secs(120);
 const FAST_FAILURE: Duration = Duration::from_secs(2);
 
 type Inflight = Shared<BoxFuture<'static, Result<Bytes, StatusCode>>>;
+
+/// A failed Core call. `may_be_running` is set only when the request reached
+/// Core and no reply came back: Core replies after the build finishes, so any
+/// reply (even an error or an oversized body) means nothing is left running.
+struct Failure {
+    status: StatusCode,
+    may_be_running: bool,
+}
+impl From<StatusCode> for Failure {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            may_be_running: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -178,7 +195,7 @@ impl ProofRelay {
     }
     /// One `getquorumproofchain` call. The response is bounded at the socket
     /// before it is buffered, and Core's error object is logged, not exposed.
-    async fn fetch(&self, params: Vec<serde_json::Value>) -> Result<serde_json::Value, StatusCode> {
+    async fn fetch(&self, params: Vec<serde_json::Value>) -> Result<serde_json::Value, Failure> {
         let rpc = &self.config.rpc;
         let auth = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", rpc.username, rpc.password));
@@ -190,11 +207,11 @@ impl ProofRelay {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(body.to_string())))
             .map_err(|e| bad_gateway!("RPC request: {e}"))?;
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|e| bad_gateway!("RPC transport: {}", chain(&e),))?;
+        let response = self.client.request(request).await.map_err(|e| Failure {
+            status: bad_gateway!("RPC transport: {}", chain(&e)),
+            // A connect failure never reached Core.
+            may_be_running: !e.is_connect(),
+        })?;
         let status = response.status();
         let body = Limited::new(response.into_body(), MAX_UPSTREAM)
             .collect()
@@ -212,12 +229,12 @@ impl ProofRelay {
                 .chars()
                 .take(200)
                 .collect();
-            return Err(bad_gateway!("RPC {status}: error {code:?} {message}"));
+            return Err(bad_gateway!("RPC {status}: error {code:?} {message}").into());
         }
         envelope
             .get_mut("result")
             .map(serde_json::Value::take)
-            .ok_or_else(|| bad_gateway!("RPC {status}: no result"))
+            .ok_or_else(|| bad_gateway!("RPC {status}: no result").into())
     }
     fn cached(&self, request: &ProofRequest) -> Result<Option<Bytes>, StatusCode> {
         let mut cache = self
@@ -266,21 +283,30 @@ impl ProofRelay {
         let fetched = tokio::time::timeout(self.deadline, self.fetch(request.params())).await;
         let timed_out = fetched.is_err();
         let result = match fetched {
-            Ok(value) => value
-                .and_then(|value| decode_response(&value))
-                .map(Bytes::from),
-            Err(_) => Err(fail(
-                StatusCode::GATEWAY_TIMEOUT,
-                format_args!("RPC exceeded {:?}", self.deadline),
-            )),
+            Ok(value) => value.and_then(|value| {
+                decode_response(&value)
+                    .map(Bytes::from)
+                    .map_err(Failure::from)
+            }),
+            Err(_) => Err(Failure {
+                status: fail(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format_args!("RPC exceeded {:?}", self.deadline),
+                ),
+                may_be_running: true,
+            }),
         };
         match result {
             Ok(bytes) => {
                 self.store(request, bytes.clone());
                 Ok(bytes)
             }
-            Err(status) => {
-                let core_may_still_be_working = timed_out || started.elapsed() >= FAST_FAILURE;
+            Err(Failure {
+                status,
+                may_be_running,
+            }) => {
+                let core_may_still_be_working =
+                    may_be_running && (timed_out || started.elapsed() >= FAST_FAILURE);
                 if core_may_still_be_working {
                     let cooldown = self.cooldown;
                     tokio::spawn(async move {
@@ -660,6 +686,27 @@ mod tests {
         assert!(relay.inflight.lock().unwrap().is_empty());
         wait_until(|| relay.workers.available_permits() == 2).await;
         assert!(started.elapsed() >= FAST_FAILURE + cooldown);
+    }
+
+    #[tokio::test]
+    async fn slow_but_complete_rpc_errors_release_the_worker() {
+        let addr = raw_server(|mut stream| async move {
+            // Core answered, just slowly: the build is over.
+            tokio::time::sleep(FAST_FAILURE + Duration::from_millis(100)).await;
+            let body = r#"{"result":null,"error":{"code":-1,"message":"Requested quorum is not in the target root"},"id":"proofs"}"#;
+            let head = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        })
+        .await;
+        let relay = relay_for(addr, Duration::from_secs(10), Duration::from_secs(60));
+        let (first, second) = tokio::join!(relay.proof(request_at(1)), relay.proof(request_at(2)));
+        assert_eq!(first, Err(StatusCode::BAD_GATEWAY));
+        assert_eq!(second, Err(StatusCode::BAD_GATEWAY));
+        assert_eq!(relay.workers.available_permits(), 2);
     }
 
     #[tokio::test]
