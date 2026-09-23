@@ -1583,6 +1583,7 @@ name = "quorum-list-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bincode",
  "bincode_derive",
  "chrono",
@@ -1592,6 +1593,9 @@ dependencies = [
  "dashcore-rpc",
  "futures",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "prost",
  "semver",

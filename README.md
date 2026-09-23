@@ -220,3 +220,46 @@ rpcpassword=password
 rpcallowip=127.0.0.1
 testnet=1
 ```
+
+### Verified snapshot proofs
+
+`POST /proofs` forwards compact Core bootstrap evidence as binary
+`application/octet-stream`, with the same API as DAPI. Configure the existing RPC
+connection to a Core build supporting `getquorumproofchain` with the required
+historical blocks retained. Core reads evidence from disk on demand; no extra
+index or startup scan is required. An unpruned node can serve older checkpoints.
+
+```json
+{"checkpoint":"<release checkpoint block hash>","height":1549547,"quorumHash":"<Platform quorum hash>","llmqType":6,"nodeCount":4}
+```
+
+Hashes use RPC display order. `height` is a minimum target height; zero selects
+Core's latest available ChainLock. Mainnet uses Platform quorum type 4, testnet 6.
+`nodeCount` is 0–15. Success contains a `DASHNC02` proof and authenticated quorum
+and EvoNode record openings, not JSON keys to trust. Clients verify it against
+an independently pinned snapshot. Gzip is supported; clients must enforce the
+1 MiB decoded response limit.
+
+The relay limits request bodies to 1 KiB, concurrent Core workers to two, and
+cached proof payloads to 16 MiB / 64 entries for 15 seconds. Invalid requests
+return 400 (or 422 for invalid JSON schema), oversized bodies 413, saturated
+workers 503, upstream failures 502, and timeouts 504. Core responses are cut off
+at the socket above roughly 4 MiB before they are buffered or parsed. Each Core
+call runs detached from the public connection: identical concurrent requests
+share one call, a client that disconnects does not free the worker early, and
+the result is cached for later callers. One 60-second deadline covers the whole
+Core round trip; hitting it drops the Core connection. Core finishes an
+already-dispatched proof anyway and replies only when it is done, so a worker
+whose call got no reply after Core started work (deadline, or the connection
+lost while waiting) stays reserved for a further 120 seconds. Any reply from
+Core, including an error, releases the worker at once. This bounds how fast the relay re-dispatches abandoned work,
+roughly one call per three minutes per worker; it is a rate limit, not a
+guarantee that Core has finished, since very long historical spans can outlast
+it. Fast failures release the worker immediately. Clients
+should allow additional time for response delivery (the SDK uses 65 seconds).
+Failure causes are logged to stderr without credentials or response bodies;
+every public error response, including malformed JSON, returns its status code
+with an empty response body.
+
+Existing `/quorums`, `/previous`, and `/masternodes` endpoints remain available
+for explicitly trusted clients. This branch does not deploy the service.
