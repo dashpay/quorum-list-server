@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to stage as a draft (for example, v0.7.0)'
+        description: 'Release tag: stage GitHub draft and publish Docker version/latest (for example, v0.7.0)'
         required: true
         type: string
   push:
@@ -155,11 +155,7 @@ jobs:
       env:
         VERSION: ${{ needs.prepare.outputs.version }}
       run: |
-        if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
-          tags=(-t "dashpay/quorum-list-server:${VERSION}-staging")
-        else
-          tags=(-t dashpay/quorum-list-server:latest -t "dashpay/quorum-list-server:${VERSION}")
-        fi
+        tags=(-t dashpay/quorum-list-server:latest -t "dashpay/quorum-list-server:${VERSION}")
         images=()
         for digest in "$RUNNER_TEMP"/digests/*; do
           images+=("dashpay/quorum-list-server@sha256:${digest##*/}")
