@@ -1,6 +1,13 @@
 name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}${{ github.event_name == 'workflow_dispatch' && ' (draft staging)' || '' }}
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to stage as a draft (for example, v0.7.0)'
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
@@ -10,9 +17,34 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+    - name: Validate release tag
+      id: meta
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo 'Expected a release tag such as v0.7.0 or v0.7.0-rc.1' >&2
+          exit 1
+        fi
+        if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          if jq -se --arg tag "$RELEASE_TAG" 'any(.[][]; .tag_name == $tag and .draft == false)' "$RUNNER_TEMP/releases.json"; then
+            echo 'Refusing to stage over a published release' >&2
+            exit 1
+          fi
+        fi
+        echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -35,10 +67,6 @@ jobs:
       with:
         toolchain: "1.91.0"
 
-    - name: Derive version from tag
-      id: meta
-      run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -57,8 +85,11 @@ jobs:
           target
         key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Test release
+      run: cargo test --release --locked
+
     - name: Build release
-      run: cargo build --release
+      run: cargo build --release --locked
 
     - name: Build and push Docker image by digest
       id: build
@@ -69,6 +100,9 @@ jobs:
         push: true
         tags: dashpay/quorum-list-server
         outputs: type=image,push-by-digest=true,name-canonical=true
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
 
     - name: Export digest
       run: |
@@ -98,13 +132,9 @@ jobs:
 
   merge-and-release:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [prepare, build]
 
     steps:
-    - name: Derive version from tag
-      id: meta
-      run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
@@ -122,11 +152,19 @@ jobs:
         merge-multiple: true
 
     - name: Create multi-platform manifest
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
       run: |
-        docker buildx imagetools create \
-          -t dashpay/quorum-list-server:latest \
-          -t dashpay/quorum-list-server:${{ steps.meta.outputs.version }} \
-          $(for f in ${{ runner.temp }}/digests/*; do echo "dashpay/quorum-list-server@sha256:$(basename $f)"; done | xargs)
+        if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+          tags=(-t "dashpay/quorum-list-server:${VERSION}-staging")
+        else
+          tags=(-t dashpay/quorum-list-server:latest -t "dashpay/quorum-list-server:${VERSION}")
+        fi
+        images=()
+        for digest in "$RUNNER_TEMP"/digests/*; do
+          images+=("dashpay/quorum-list-server@sha256:${digest##*/}")
+        done
+        docker buildx imagetools create "${tags[@]}" "${images[@]}"
 
     - name: Download binaries
       uses: actions/download-artifact@v4
@@ -135,10 +173,20 @@ jobs:
         path: ${{ runner.temp }}/binaries
         merge-multiple: true
 
+    - name: Checksum release archives
+      run: |
+        cd "$RUNNER_TEMP/binaries"
+        sha256sum ./*.tar.gz > SHA256SUMS
+
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: ${{ runner.temp }}/binaries/*.tar.gz
+        tag_name: ${{ env.RELEASE_TAG }}
+        target_commitish: ${{ github.sha }}
+        draft: ${{ github.event_name == 'workflow_dispatch' }}
+        files: |
+          ${{ runner.temp }}/binaries/*.tar.gz
+          ${{ runner.temp }}/binaries/SHA256SUMS
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
