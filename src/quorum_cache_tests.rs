@@ -548,6 +548,51 @@ async fn should_attempt_the_window_even_when_the_current_list_fails() {
     assert!(previous.contains_quorum(&hex::decode(hash(1)).unwrap()));
 }
 
+/// An unavailable active list cannot produce a window and must not trigger historical RPCs.
+#[tokio::test]
+async fn should_skip_historical_queries_when_the_active_tip_retry_fails() {
+    check_unavailable_active_list_skips_history(false).await;
+}
+
+/// An empty tip retry must stop before spending RPCs on an unusable historical window.
+#[tokio::test]
+async fn should_skip_historical_queries_when_the_active_tip_retry_is_empty() {
+    check_unavailable_active_list_skips_history(true).await;
+}
+
+async fn check_unavailable_active_list_skips_history(empty: bool) {
+    let core = jameson();
+    {
+        let mut state = core.state.lock().unwrap();
+        state.fail_current = !empty;
+        state.empty = empty;
+    }
+    let cache = QuorumCache::new(core.config.clone());
+    assert!(cache.refresh().await.is_err());
+    assert!(cache.get_quorums().await.is_err());
+    assert!(cache.get_previous_quorums().await.is_err());
+    let sampled: Vec<u64> = core
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|call| call["params"][0] == "listextended")
+        .map(|call| call["params"][1].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        sampled.iter().filter(|&&height| height != 13271).count(),
+        0,
+        "history cannot recover a window without a populated active list at the tip"
+    );
+    assert_eq!(
+        sampled,
+        [13271, 13271],
+        "the active tip must still be retried"
+    );
+    assert!(core.info_calls().is_empty());
+}
+
 /// Malformed or empty upstream data must not become a successful trusted-key response.
 #[tokio::test]
 async fn should_never_publish_an_empty_or_malformed_success() {

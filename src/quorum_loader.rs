@@ -177,9 +177,12 @@ fn load_window(
     let floor = tip.saturating_sub(config.quorum_retention());
     // Retry the tip for the window even if the independent active-list fetch failed.
     let active = match current {
-        Ok(list) => Ok(list.clone()),
-        Err(_) => load_at_height(client, config, tip, memo, deadline, false),
+        Ok(list) => list.clone(),
+        Err(_) => load_at_height(client, config, tip, memo, deadline, false)?,
     };
+    if active.is_empty() {
+        return Err("Core returned no active Platform quorums".into());
+    }
     let mut window = QuorumList::new();
     let mut height = tip;
     let mut history_error = None;
@@ -188,16 +191,14 @@ fn load_window(
         height = height.saturating_sub(step).max(floor);
         match load_at_height(client, config, height, memo, deadline, true) {
             Ok(list) => {
-                if let Ok(tip_active) = &active {
-                    for entry in tip_active.iter() {
-                        if u64::from(entry.height) + 18 <= u64::from(height)
-                            && !list.contains_quorum(&entry.quorum_hash)
-                        {
-                            return Err(
-                                "Historical sample is missing a quorum that must still be active"
-                                    .into(),
-                            );
-                        }
+                for entry in active.iter() {
+                    if u64::from(entry.height) + 18 <= u64::from(height)
+                        && !list.contains_quorum(&entry.quorum_hash)
+                    {
+                        return Err(
+                            "Historical sample is missing a quorum that must still be active"
+                                .into(),
+                        );
                     }
                 }
                 for entry in list.list {
@@ -209,10 +210,6 @@ fn load_window(
                 break;
             }
         }
-    }
-    let active = active?;
-    if active.is_empty() {
-        return Err("Core returned no active Platform quorums".into());
     }
     if let Some(error) = history_error {
         return Err(error);
