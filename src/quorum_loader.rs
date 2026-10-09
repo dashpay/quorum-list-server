@@ -12,12 +12,12 @@ pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Only immutable public keys are memoized; membership always comes from Core.
 #[derive(Default)]
 pub struct KeyMemo {
-    keys: HashMap<String, Vec<u8>>,
-    order: VecDeque<String>,
+    keys: HashMap<(String, String), Vec<u8>>,
+    order: VecDeque<(String, String)>,
 }
 
 impl KeyMemo {
-    fn insert(&mut self, hash: String, key: Vec<u8>, capacity: usize) {
+    fn insert(&mut self, hash: (String, String), key: Vec<u8>, capacity: usize) {
         if self.keys.contains_key(&hash) {
             return;
         }
@@ -92,6 +92,14 @@ fn load_at_height(
             if hash_bytes.len() != 32 {
                 return Err("Invalid quorum hash length".into());
             }
+            let mined_hash = details
+                .get("minedBlockHash")
+                .and_then(Value::as_str)
+                .ok_or("Missing quorum mined block hash")?;
+            if hex::decode(mined_hash)?.len() != 32 {
+                return Err("Invalid mined block hash length".into());
+            }
+            let memo_key = (hash.clone(), mined_hash.to_string());
             let creation_height = details
                 .get("creationHeight")
                 .and_then(Value::as_u64)
@@ -102,7 +110,7 @@ fn load_at_height(
                 .ok_or("Missing quorum valid member count")?;
             let creation_height = u32::try_from(creation_height)?;
             let valid_members = u32::try_from(valid_members)?;
-            let public_key = match memo.keys.get(hash) {
+            let public_key = match memo.keys.get(&memo_key) {
                 Some(key) => key.clone(),
                 None => {
                     check_deadline(deadline)?;
@@ -123,11 +131,7 @@ fn load_at_height(
                     if key.len() != 48 {
                         return Err("Invalid quorum public key length".into());
                     }
-                    memo.insert(
-                        hash.clone(),
-                        key.clone(),
-                        config.quorum.key_memo_max_entries,
-                    );
+                    memo.insert(memo_key, key.clone(), config.quorum.key_memo_max_entries);
                     key
                 }
             };
@@ -169,7 +173,7 @@ fn load_window(
     memo: &mut KeyMemo,
     deadline: Instant,
 ) -> LoadResult<(u32, QuorumList)> {
-    let step = config.quorum_sample_step()?;
+    let step = config.quorum_sample_step();
     let floor = tip.saturating_sub(config.quorum_retention());
     // Retry the tip for the window even if the independent active-list fetch failed.
     let active = match current {
@@ -184,6 +188,18 @@ fn load_window(
         height = height.saturating_sub(step).max(floor);
         match load_at_height(client, config, height, memo, deadline, true) {
             Ok(list) => {
+                if let Ok(tip_active) = &active {
+                    for entry in tip_active.iter() {
+                        if u64::from(entry.height) + 18 <= u64::from(height)
+                            && !list.contains_quorum(&entry.quorum_hash)
+                        {
+                            return Err(
+                                "Historical sample is missing a quorum that must still be active"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 for entry in list.list {
                     window.add_entry(entry);
                 }
@@ -220,7 +236,6 @@ fn load_window(
 
 /// Blocking RPC work; callers must run this on a blocking worker.
 pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult> {
-    config.quorum_sample_step()?;
     let deadline = Instant::now() + REFRESH_TIMEOUT;
     let client = client(config)?;
     let tip = block_height(&client)?;
@@ -231,10 +246,14 @@ pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult>
             Ok(list)
         }
     });
-    let previous = load_window(&client, config, tip, &current, memo, deadline);
-    check_deadline(deadline)?;
-    if block_height(&client)? != tip {
-        return Err("Core tip changed during quorum refresh".into());
+    let mut previous = load_window(&client, config, tip, &current, memo, deadline);
+    let next_tip = block_height(&client)?;
+    if next_tip != tip {
+        let next_active = load_at_height(&client, config, next_tip, memo, deadline, false);
+        previous = load_window(&client, config, next_tip, &next_active, memo, deadline);
+        if block_height(&client)? != next_tip {
+            previous = Err("Core tip changed again while retrying the rolling window".into());
+        }
     }
     Ok(RefreshResult {
         tip,
@@ -251,11 +270,11 @@ mod tests {
     fn key_memo_is_bounded_and_evicts_oldest() {
         let mut memo = KeyMemo::default();
         for id in 0..3 {
-            memo.insert(id.to_string(), vec![id], 2);
+            memo.insert((id.to_string(), "mined".into()), vec![id], 2);
         }
         assert_eq!(memo.keys.len(), 2);
-        assert!(!memo.keys.contains_key("0"));
-        assert!(memo.keys.contains_key("2"));
+        assert!(!memo.keys.contains_key(&("0".into(), "mined".into())));
+        assert!(memo.keys.contains_key(&("2".into(), "mined".into())));
         assert_eq!(memo.order.len(), 2);
     }
 }

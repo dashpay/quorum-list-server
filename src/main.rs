@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration
     let config = Config::load_from_env_or_file("config.toml");
-    if let Err(error) = config.quorum_sample_step() {
+    if let Err(error) = config.validate_quorum() {
         eprintln!("Invalid quorum configuration: {error}");
         return Err(std::io::Error::other(error.to_string()).into());
     }

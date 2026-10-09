@@ -6,7 +6,7 @@ A Rust-based HTTP API server providing the configured network's Platform quorum 
 
 - RPC-based Platform quorum loading for mainnet, testnet, devnet and regtest
 - RESTful API for quorum list management
-- TOML-based configuration with environment variable fallbacks
+- TOML-based configuration with environment variable overrides
 - Stateless rolling window of active and recently retired quorums
 - Thread-safe shared state
 - Cross-platform support (Linux/Windows)
@@ -15,7 +15,8 @@ A Rust-based HTTP API server providing the configured network's Platform quorum 
 ## API Endpoints
 
 ### Health Check
-- `GET /health` - Quorum cache freshness status
+- `GET /health` - Quorum cache freshness status (HTTP 200, inspect the JSON body)
+- `GET /ready` - Readiness status (HTTP 503 while degraded, 200 when fresh)
 
 ### Quorum Management
 - `GET /quorums` - Get all current quorums
@@ -54,7 +55,9 @@ blocks. Sampling every `A*D` blocks could miss a quorum. The conservative maximu
 step is `(A-1)*D + 1`, allowing any mining offset within a cycle. The default is
 `max(1, min(A*D/2, (A-1)*D+1))`. Failed DKGs lengthen active runs. Parameter
 overrides must match the connected Core; unsafe steps, zero intervals and zero
-cache limits are rejected at startup with an error. See Core's
+cache limits are rejected at startup with an error. The output cap must exceed A,
+the key memo must hold at least the output cap, and a window may use at most
+256 samples (including both boundaries) to limit work within the refresh budget. See Core's
 [parameter table](https://github.com/dashpay/dash/blob/v24.0.0-rc.3/src/llmq/params.h)
 and [mined commitment scan](https://github.com/dashpay/dash/blob/v24.0.0-rc.3/src/llmq/quorumsman.cpp#L243-L244).
 
@@ -67,7 +70,9 @@ accelerated 10-second devnets typically need 360–720 blocks to cover Core/Plat
 lag, a Platform block interval, the client's 31-minute metadata tolerance and
 clock skew.
 
-A bounded public-key memo avoids repeat `quorum info` calls for known hashes.
+A bounded public-key memo keyed by `(quorumHash, minedBlockHash)` avoids repeat
+`quorum info` calls for unchanged commitments. A reorg can replace a commitment
+and its public key for the same quorum hash; the new mined block forces a refetch.
 All such calls explicitly use `includeSkShare=false`. Membership is recomputed,
 not taken from the memo. All quorum RPC runs on a serialized blocking worker;
 requests only read cached data. RPC sockets have a five-second timeout, refreshes
@@ -79,10 +84,19 @@ changes. The cache TTL bounds reloads even at an unchanged height (including
 same-height reorgs), and a poll interval longer than the TTL is reduced to the
 TTL. Both lists are attempted independently and keep their last good data on
 failure. An empty active list or invalid quorum/key data is a failed refresh,
-never an empty success. `/health` still returns HTTP 200 and the same JSON shape;
+never an empty success. Historical samples must contain every tip-active quorum
+whose creation height plus the mining-window end (18 blocks) precedes the sample;
+a short or empty result missing such a quorum fails the window refresh. A moving
+tip preserves the current list tied to its sampled height and retries the window
+once at the new tip. Repeated failed window reloads back off up to the smaller of
+30 seconds and the TTL; a newly observed tip bypasses this backoff.
+
+`/health` still returns HTTP 200 and the same JSON shape;
 it returns `success:false`, `data:null` and a degraded message when either list
 has never loaded or its last successful refresh is older than
-`cache_ttl_seconds * health_stale_intervals` (three intervals by default).
+`cache_ttl_seconds * health_stale_intervals` (three intervals by default). `/ready`
+returns the same body with HTTP 503 while degraded and HTTP 200 when fresh, so
+load balancers can use it without changing existing `/health` matchers.
 
 ### Masternode bootstrap metadata
 
@@ -152,7 +166,7 @@ health_stale_intervals = 3
 # dkg_interval = 24
 ```
 
-### Environment Variables (fallbacks)
+### Environment Variables (overrides)
 - `API_HOST` - Server host (default: 0.0.0.0)
 - `API_PORT` - HTTP server port (default: 3000)
 - `DASH_RPC_URL` - RPC endpoint (default: http://127.0.0.1:19998)
@@ -160,7 +174,7 @@ health_stale_intervals = 3
 - `DASH_RPC_PASSWORD` - RPC password (default: password)
 - `DASH_NETWORK` - mainnet, testnet, devnet or regtest (default: testnet)
 
-| TOML `[quorum]` key | Environment fallback | Default |
+| TOML `[quorum]` key | Environment override | Default |
 | --- | --- | --- |
 | `previous_blocks_offset` | `QUORUM_PREVIOUS_BLOCKS_OFFSET` | 8; lower bound on retention |
 | `retention_blocks` | `QUORUM_RETENTION_BLOCKS` | 48 |
@@ -173,8 +187,8 @@ health_stale_intervals = 3
 | `poll_interval_seconds` | `QUORUM_POLL_INTERVAL_SECONDS` | 1 |
 | `health_stale_intervals` | `QUORUM_HEALTH_STALE_INTERVALS` | 3 |
 
-A valid TOML file takes precedence over all environment variables. When the
-file cannot be loaded, environment variables supply fallbacks. Older TOML files
+Environment variables override TOML values. When the file cannot be loaded,
+environment variables override the built-in defaults. Older TOML files
 with only `previous_blocks_offset` continue to work with the new defaults.
 
 ## Usage
@@ -183,7 +197,7 @@ with only `previous_blocks_offset` continue to work with the new defaults.
 # Start the server (uses config.toml)
 cargo run
 
-# With environment variables (when config.toml is absent)
+# With environment variables (overrides config.toml)
 DASH_RPC_URL="http://192.168.1.100:19998" DASH_RPC_USER="myuser" cargo run
 
 # Different port
@@ -213,7 +227,7 @@ docker run --rm -p 8080:8080 \
   quorum-list-server
 ```
 
-The server reads `/app/config.toml` first; environment variables are only used when that file is absent.
+The server reads `/app/config.toml` first, then applies environment overrides.
 
 ## API Examples
 
@@ -270,7 +284,7 @@ Example quorum response:
 
 - **RPC Integration**: Uses `dashcore-rpc` to communicate with Dash Core
 - **LLMQ Type**: Processes the configured network's Platform quorum type
-- **Configuration**: TOML-first with environment variable fallbacks
+- **Configuration**: TOML values with environment variable overrides
 - **State Management**: Cached lists and freshness metadata published under one lock
 - **API Framework**: Built with Axum for async HTTP handling
 

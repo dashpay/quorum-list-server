@@ -71,8 +71,8 @@ impl QuorumCache {
         T: Send + 'static,
         F: FnOnce() -> LoadResult<T> + Send + 'static,
     {
+        let permit = self.rpc_worker.clone().lock_owned().await;
         tokio::time::timeout(REFRESH_TIMEOUT, async {
-            let permit = self.rpc_worker.clone().lock_owned().await;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 work()
@@ -89,7 +89,12 @@ impl QuorumCache {
         let memo = self.memo.clone();
         let result = self
             .rpc_work(move || {
-                let mut memo = memo.lock().map_err(|_| "Failed to lock quorum key memo")?;
+                let mut memo = memo.lock().unwrap_or_else(|poisoned| {
+                    memo.clear_poison();
+                    let mut memo = poisoned.into_inner();
+                    *memo = KeyMemo::default();
+                    memo
+                });
                 quorum_loader::refresh(&config, &mut memo)
             })
             .await?;
@@ -148,19 +153,23 @@ impl QuorumCache {
         }
     }
 
-    fn reload_due(&self, tip: u32) -> LoadResult<bool> {
+    fn reload_due(&self, tip: u32) -> LoadResult<(bool, bool)> {
         let state = self
             .state
             .read()
             .map_err(|_| "Failed to read quorum cache")?;
         Ok(match (&state.current, &state.previous) {
             (Some(current), Some(previous)) => {
-                current.height != tip
-                    || current.refreshed.elapsed() >= self.update_interval
-                    || previous.refreshed.elapsed() >= self.update_interval
-                    || previous.height != tip.saturating_sub(self.config.quorum_retention())
+                let changed = current.height != tip;
+                (
+                    changed,
+                    changed
+                        || current.refreshed.elapsed() >= self.update_interval
+                        || previous.refreshed.elapsed() >= self.update_interval
+                        || previous.height != tip.saturating_sub(self.config.quorum_retention()),
+                )
             }
-            _ => true,
+            _ => (true, true),
         })
     }
 
@@ -171,6 +180,8 @@ impl QuorumCache {
                 .max(Duration::from_millis(1));
             let mut poll = tokio::time::interval(poll_interval);
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut failures = 0u32;
+            let mut retry_after = tokio::time::Instant::now();
             loop {
                 poll.tick().await;
                 let config = self.config.clone();
@@ -179,12 +190,26 @@ impl QuorumCache {
                     .await
                 {
                     Ok(tip) => match self.reload_due(tip) {
-                        Ok(true) => {
-                            if let Err(error) = self.refresh().await {
-                                eprintln!("Quorum refresh failed: {error}");
+                        Ok((changed, true))
+                            if changed || tokio::time::Instant::now() >= retry_after =>
+                        {
+                            match self.refresh().await {
+                                Ok(()) => {
+                                    failures = 0;
+                                }
+                                Err(error) => {
+                                    eprintln!("Quorum refresh failed: {error}");
+                                    failures = failures.saturating_add(1);
+                                    let delay = poll_interval
+                                        .saturating_mul(1 << failures.saturating_sub(1).min(5))
+                                        .min(self.update_interval)
+                                        .min(Duration::from_secs(30));
+                                    retry_after = tokio::time::Instant::now() + delay;
+                                }
                             }
                         }
-                        Ok(false) => {}
+                        Ok((_, true)) => {}
+                        Ok((_, false)) => {}
                         Err(error) => eprintln!("Cannot read quorum refresh state: {error}"),
                     },
                     Err(error) => eprintln!("Core tip poll failed: {error}"),

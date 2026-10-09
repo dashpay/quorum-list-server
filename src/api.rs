@@ -114,6 +114,7 @@ pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode
     let shared_config = Arc::new(config);
     Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
         .route("/quorums", get(get_all_quorums))
         .route("/quorums/stats", get(get_quorum_stats))
         .route("/previous", get(get_previous_quorums))
@@ -134,6 +135,14 @@ async fn health_check(
     } else {
         Json(ApiResponse::error("Quorum List Server is degraded: quorum refresh is stale or unavailable".to_string()))
     }
+}
+
+async fn readiness_check(
+    state: State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    let response = health_check(state).await;
+    let status = if response.0.success { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, response)
 }
 
 async fn get_all_quorums(

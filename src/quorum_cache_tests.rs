@@ -25,6 +25,9 @@ pub struct CoreState {
     pub fail_current_once: bool,
     pub delay: Duration,
     pub omitted_type_before: Option<u32>,
+    pub commitments: std::collections::HashMap<u32, u32>,
+    pub omit_at_height: Option<u32>,
+    pub tip_script: std::collections::VecDeque<u32>,
 }
 
 pub struct MockCore {
@@ -55,6 +58,9 @@ impl MockCore {
             fail_current_once: false,
             delay: Duration::ZERO,
             omitted_type_before: None,
+            commitments: std::collections::HashMap::new(),
+            omit_at_height: None,
+            tip_script: std::collections::VecDeque::new(),
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -102,6 +108,11 @@ impl MockCore {
                     serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
                 let mut state = worker_state.lock().unwrap();
                 state.calls.push(request.clone());
+                if request["method"] == "getblockcount" {
+                    if let Some(tip) = state.tip_script.pop_front() {
+                        state.tip = tip;
+                    }
+                }
                 let height = request["params"][1]
                     .as_u64()
                     .map(|h| h as u32)
@@ -127,13 +138,16 @@ impl MockCore {
                         json!({})
                     } else {
                         let entries: Vec<Value> = state.quorums.iter()
-                            .filter(|q| !state.empty && q.created <= height && height < q.retired)
-                            .map(|q| json!({hash(q.id): {"creationHeight":q.created, "numValidMembers":12}}))
+                            .filter(|q| !state.empty && state.omit_at_height != Some(height) && q.created <= height && height < q.retired)
+                            .map(|q| json!({hash(q.id): {"creationHeight":q.created, "numValidMembers":12, "minedBlockHash":hash(q.id + 100000 + state.commitments.get(&q.id).copied().unwrap_or(0))}}))
                             .collect();
                         json!({"llmq_devnet_platform": entries})
                     }
                 } else {
-                    json!({"quorumPublicKey": "11".repeat(48)})
+                    let id = u32::from_str_radix(&request["params"][2].as_str().unwrap()[56..], 16)
+                        .unwrap();
+                    let commitment = state.commitments.get(&id).copied().unwrap_or(0);
+                    json!({"quorumPublicKey": format!("{:02x}", 17 + commitment).repeat(48)})
                 };
                 let body = if failed {
                     json!({"result":null, "error":{"code":-1,"message":"Core unavailable"}, "id":request["id"]})
@@ -593,7 +607,7 @@ async fn should_reject_steps_that_miss_quorums_with_variable_mining_offsets() {
     core.config.quorum.sample_step_blocks = Some(96);
     // The naive grid 299, 203, 107, 11 skips a quorum active on [18, 106).
     assert!(
-        core.config.quorum_sample_step().is_err(),
+        core.config.validate_quorum().is_err(),
         "A*D is unsafe when commitment mining offsets vary"
     );
     core.config.quorum.sample_step_blocks = Some(73);
@@ -640,4 +654,89 @@ async fn should_serve_the_window_when_the_floor_precedes_platform_quorum_activat
     assert_eq!(floor, 0);
     assert_eq!(window.len(), 1);
     assert!(window.contains_quorum(&hex::decode(hash(1)).unwrap()));
+}
+
+/// A replacement final commitment for the same quorum hash must replace its key.
+#[tokio::test]
+async fn should_refetch_a_key_when_the_mined_commitment_changes() {
+    let core = jameson();
+    let cache = QuorumCache::new(core.config.clone());
+    cache.refresh().await.unwrap();
+    let before = core.info_calls().len();
+    core.state.lock().unwrap().commitments.insert(5, 1);
+    cache.refresh().await.unwrap();
+    assert_eq!(core.info_calls().len(), before + 1);
+    let list = cache.get_quorums().await.unwrap();
+    assert_eq!(
+        list.get_entry(&hex::decode(hash(5)).unwrap()).unwrap().key,
+        vec![18; 48]
+    );
+}
+
+/// Core's empty historical result must not erase a quorum that must exist there.
+#[tokio::test]
+async fn should_reject_a_historical_sample_missing_an_older_active_quorum() {
+    let core = jameson();
+    let cache = QuorumCache::new(core.config.clone());
+    cache.refresh().await.unwrap();
+    let before = cache.get_previous_quorums().await.unwrap();
+    core.state.lock().unwrap().omit_at_height = Some(13223);
+    assert!(cache.refresh().await.is_err());
+    assert_eq!(cache.get_previous_quorums().await.unwrap(), before);
+}
+
+/// Readiness gives load balancers a failing status without changing health's HTTP status.
+#[tokio::test]
+async fn should_return_service_unavailable_when_not_ready() {
+    use axum::{body::Body, http::Request};
+    use tower::Service;
+    let core = jameson();
+    let cache = Arc::new(QuorumCache::new(core.config.clone()));
+    let masternodes = Arc::new(crate::masternode_cache::MasternodeCache::new(
+        core.config.clone(),
+    ));
+    let mut router = crate::api::create_router(cache.clone(), core.config.clone(), masternodes);
+    let response = router
+        .call(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    cache.refresh().await.unwrap();
+    let response = router
+        .call(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+/// A moving chain must not discard an active list tied to an explicit sampled height.
+#[tokio::test]
+async fn should_publish_current_and_retry_the_window_when_the_tip_moves() {
+    let core = jameson();
+    {
+        let mut state = core.state.lock().unwrap();
+        state.tip_script = [13271, 13295, 13295].into();
+        state.quorums.push(Quorum {
+            id: 6,
+            created: 13286,
+            retired: u32::MAX,
+        });
+    }
+    let cache = QuorumCache::new(core.config.clone());
+    cache.refresh().await.unwrap();
+    assert_eq!(cache.get_snapshot().await.unwrap().height, 13271);
+    let (floor, previous) = cache.get_previous_quorums().await.unwrap();
+    assert_eq!(floor, 13247);
+    assert!(previous.contains_quorum(&hex::decode(hash(6)).unwrap()));
+    assert!(cache.is_healthy().await);
 }
