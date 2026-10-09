@@ -415,6 +415,7 @@ previous_blocks_offset = 8
         assert_eq!(config.get_llmq_type_id(), 107);
     }
 
+    /// Legacy TOML must gain retention defaults and safe per-network sampling.
     #[test]
     fn should_default_legacy_configs_to_a_safe_rolling_window() {
         let quorum: QuorumConfig = toml::from_str("previous_blocks_offset = 8").unwrap();
@@ -437,6 +438,7 @@ previous_blocks_offset = 8
         }
     }
 
+    /// Invalid intervals and arithmetic must fail before background work starts.
     #[test]
     fn should_reject_invalid_quorum_intervals_and_limits() {
         let mut config = Config::default();
@@ -452,6 +454,7 @@ previous_blocks_offset = 8
         assert!(config.validate_quorum().is_err());
     }
 
+    /// Injected environment settings must preserve all quorum knobs without global test races.
     #[test]
     fn should_preserve_quorum_env_fallbacks() {
         let variables = [
@@ -496,6 +499,7 @@ previous_blocks_offset = 8
         assert_eq!(config.rpc.url, "http://core.example:9998");
     }
 
+    /// The shipped TOML must use the same schema as the configuration loader.
     #[test]
     fn should_load_the_shipped_config_file() {
         let config: Config = toml::from_str(include_str!("../config.toml")).unwrap();

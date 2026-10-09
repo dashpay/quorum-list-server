@@ -131,9 +131,13 @@ async fn health_check(
     State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Json<ApiResponse<String>> {
     if quorum_cache.is_healthy().await {
-        Json(ApiResponse::success("Quorum List Server is running".to_string()))
+        Json(ApiResponse::success(
+            "Quorum List Server is running".to_string(),
+        ))
     } else {
-        Json(ApiResponse::error("Quorum List Server is degraded: quorum refresh is stale or unavailable".to_string()))
+        Json(ApiResponse::error(
+            "Quorum List Server is degraded: quorum refresh is stale or unavailable".to_string(),
+        ))
     }
 }
 
@@ -141,7 +145,11 @@ async fn readiness_check(
     state: State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     let response = health_check(state).await;
-    let status = if response.0.success { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status = if response.0.success {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (status, response)
 }
 
@@ -150,13 +158,17 @@ async fn get_all_quorums(
 ) -> Result<Json<ApiResponse<Vec<QuorumEntryResponse>>>, StatusCode> {
     match quorum_cache.get_snapshot().await {
         Ok(snapshot) => {
-            let quorums: Vec<QuorumEntryResponse> = snapshot.quorums.iter().map(|entry| entry.into()).collect();
+            let quorums: Vec<QuorumEntryResponse> =
+                snapshot.quorums.iter().map(|entry| entry.into()).collect();
             let mut response = ApiResponse::success(quorums);
             response.height = Some(snapshot.height);
             response.last_updated = Some(snapshot.last_updated);
             Ok(Json(response))
         }
-        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load quorums: {}", e))))
+        Err(e) => Ok(Json(ApiResponse::error(format!(
+            "Failed to load quorums: {}",
+            e
+        )))),
     }
 }
 

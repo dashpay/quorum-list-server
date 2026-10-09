@@ -2,7 +2,8 @@ use crate::config::Config;
 use crate::quorum_list::QuorumList;
 use crate::quorum_loader::{self, KeyMemo, LoadResult, REFRESH_TIMEOUT};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Clone)]
 pub struct QuorumSnapshot {

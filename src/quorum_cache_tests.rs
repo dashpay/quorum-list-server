@@ -28,6 +28,8 @@ pub struct CoreState {
     pub commitments: std::collections::HashMap<u32, u32>,
     pub omit_at_height: Option<u32>,
     pub tip_script: std::collections::VecDeque<u32>,
+    pub first_response_gate: Option<std::sync::mpsc::Receiver<()>>,
+    pub omit_only: Option<u32>,
 }
 
 pub struct MockCore {
@@ -61,6 +63,8 @@ impl MockCore {
             commitments: std::collections::HashMap::new(),
             omit_at_height: None,
             tip_script: std::collections::VecDeque::new(),
+            first_response_gate: None,
+            omit_only: None,
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -138,7 +142,7 @@ impl MockCore {
                         json!({})
                     } else {
                         let entries: Vec<Value> = state.quorums.iter()
-                            .filter(|q| !state.empty && state.omit_at_height != Some(height) && q.created <= height && height < q.retired)
+                            .filter(|q| !state.empty && (state.omit_at_height != Some(height) || state.omit_only.is_some_and(|id| id != q.id)) && q.created <= height && height < q.retired)
                             .map(|q| json!({hash(q.id): {"creationHeight":q.created, "numValidMembers":12, "minedBlockHash":hash(q.id + 100000 + state.commitments.get(&q.id).copied().unwrap_or(0))}}))
                             .collect();
                         json!({"llmq_devnet_platform": entries})
@@ -155,7 +159,11 @@ impl MockCore {
                     json!({"result":result, "error":null, "id":request["id"]})
                 }.to_string();
                 let delay = state.delay;
+                let gate = state.first_response_gate.take();
                 drop(state);
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
                 std::thread::sleep(delay);
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 let _ = stream.write_all(response.as_bytes());
@@ -230,6 +238,7 @@ fn jameson() -> MockCore {
     )
 }
 
+/// A cold client must retain a signer retired beyond the legacy snapshot.
 #[tokio::test]
 async fn should_serve_a_quorum_retired_after_the_previous_snapshot_height() {
     let core = jameson();
@@ -248,6 +257,7 @@ async fn should_serve_a_quorum_retired_after_the_previous_snapshot_height() {
     assert_eq!(height, 13223);
 }
 
+/// Successful and failed DKG schedules must leave no signer missing from the window.
 #[tokio::test]
 async fn should_cover_every_quorum_active_in_the_window() {
     for failed_dkg in [None, Some(8), Some(9)] {
@@ -299,11 +309,15 @@ async fn should_cover_every_quorum_active_in_the_window() {
     }
 }
 
+/// A cold restart must reconstruct the same window as a cache warmed through rotations.
 #[tokio::test]
 async fn should_return_the_same_window_after_restart() {
     let core = jameson();
     let first = QuorumCache::new(core.config.clone());
-    first.refresh().await.unwrap();
+    for tip in [13223, 13247, 13271] {
+        core.state.lock().unwrap().tip = tip;
+        first.refresh().await.unwrap();
+    }
     let second = QuorumCache::new(core.config.clone());
     second.refresh().await.unwrap();
     assert_eq!(
@@ -312,6 +326,7 @@ async fn should_return_the_same_window_after_restart() {
     );
 }
 
+/// Unchanged commitments must not repeatedly fetch their public keys.
 #[tokio::test]
 async fn should_not_call_quorum_info_again_for_memoized_hashes() {
     let core = jameson();
@@ -326,6 +341,7 @@ async fn should_not_call_quorum_info_again_for_memoized_hashes() {
     );
 }
 
+/// Every key lookup must explicitly exclude secret shares.
 #[tokio::test]
 async fn should_never_request_secret_key_shares() {
     let core = jameson();
@@ -356,10 +372,21 @@ pub async fn endpoint(cache: Arc<QuorumCache>, config: Config, path: &str) -> Va
         .call(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    let status = response.status();
+    let value: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        status,
+        if path == "/ready" && value["success"] == false {
+            503
+        } else {
+            200
+        }
+    );
+    value
 }
 
+/// Height and refresh metadata must describe the cached list while keeping its array shape.
 #[tokio::test]
 async fn should_report_the_core_height_on_quorums() {
     let core = jameson();
@@ -375,6 +402,7 @@ async fn should_report_the_core_height_on_quorums() {
     );
 }
 
+/// Core failures must preserve data and become visible through health and readiness.
 #[tokio::test]
 async fn should_keep_last_good_window_and_report_degraded_health_on_core_failure() {
     let mut core = jameson();
@@ -388,7 +416,10 @@ async fn should_keep_last_good_window_and_report_degraded_health_on_core_failure
         before,
         endpoint(cache.clone(), core.config.clone(), "/previous").await
     );
-    tokio::time::sleep(Duration::from_millis(3100)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    let ready = endpoint(cache.clone(), core.config.clone(), "/ready").await;
+    assert_eq!(ready["success"], false);
     let health = endpoint(cache, core.config.clone(), "/health").await;
     assert_eq!(
         health["success"], false,
@@ -397,6 +428,7 @@ async fn should_keep_last_good_window_and_report_degraded_health_on_core_failure
     assert!(health["message"].as_str().unwrap().contains("degraded"));
 }
 
+/// New signing keys must become available without waiting for the cache TTL.
 #[tokio::test]
 async fn should_reload_when_the_tip_changes_before_the_ttl() {
     let core = jameson();
@@ -431,6 +463,7 @@ async fn should_reload_when_the_tip_changes_before_the_ttl() {
     }
 }
 
+/// Trimming must preserve active keys and response order must protect newest client cache entries.
 #[tokio::test]
 async fn should_order_oldest_to_newest_and_trim_retired_first_at_the_cap() {
     let quorums = (0..12)
@@ -456,6 +489,7 @@ async fn should_order_oldest_to_newest_and_trim_retired_first_at_the_cap() {
     }
 }
 
+/// The retention floor and legacy offset must leave no unsampled boundary gap.
 #[tokio::test]
 async fn should_sample_the_lower_boundary_and_preserve_legacy_offset_coverage() {
     let mut core = jameson();
@@ -487,6 +521,7 @@ async fn should_sample_the_lower_boundary_and_preserve_legacy_offset_coverage() 
     assert_eq!(sampled, [13271, 13224, 13177, 13170]);
 }
 
+/// A failed historical query must never replace a complete window with a partial one.
 #[tokio::test]
 async fn should_keep_the_window_when_a_historical_sample_fails() {
     let core = jameson();
@@ -501,6 +536,7 @@ async fn should_keep_the_window_when_a_historical_sample_fails() {
     );
 }
 
+/// An active-list failure must not skip the independently recoverable rolling window.
 #[tokio::test]
 async fn should_attempt_the_window_even_when_the_current_list_fails() {
     let core = jameson();
@@ -512,6 +548,7 @@ async fn should_attempt_the_window_even_when_the_current_list_fails() {
     assert!(previous.contains_quorum(&hex::decode(hash(1)).unwrap()));
 }
 
+/// Malformed or empty upstream data must not become a successful trusted-key response.
 #[tokio::test]
 async fn should_never_publish_an_empty_or_malformed_success() {
     let core = jameson();
@@ -538,11 +575,13 @@ async fn should_never_publish_an_empty_or_malformed_success() {
     );
 }
 
+/// Reorgs must remove orphaned membership without refetching unchanged commitments.
 #[tokio::test]
 async fn should_drop_orphaned_quorums_after_a_reorg_without_clearing_the_memo() {
     let core = jameson();
     let cache = QuorumCache::new(core.config.clone());
     cache.refresh().await.unwrap();
+    let initial_info_calls = core.info_calls().len();
     {
         let mut state = core.state.lock().unwrap();
         state.tip -= 1;
@@ -554,11 +593,17 @@ async fn should_drop_orphaned_quorums_after_a_reorg_without_clearing_the_memo() 
         });
     }
     cache.refresh().await.unwrap();
+    assert_eq!(
+        core.info_calls().len(),
+        initial_info_calls + 1,
+        "unchanged commitments must remain memoized across a reorg"
+    );
     let (_, previous) = cache.get_previous_quorums().await.unwrap();
     assert!(!previous.contains_quorum(&hex::decode(hash(5)).unwrap()));
     assert!(previous.contains_quorum(&hex::decode(hash(6)).unwrap()));
 }
 
+/// The TTL must force reloads even when Core height does not advance.
 #[tokio::test]
 async fn should_reload_unchanged_height_at_the_ttl() {
     let mut core = jameson();
@@ -587,6 +632,7 @@ async fn should_reload_unchanged_height_at_the_ttl() {
     }
 }
 
+/// Unsafe sampling must be rejected when commitment mining offsets shorten active runs.
 #[tokio::test]
 async fn should_reject_steps_that_miss_quorums_with_variable_mining_offsets() {
     let starts: Vec<u32> = (0..16)
@@ -621,22 +667,27 @@ async fn should_reject_steps_that_miss_quorums_with_variable_mining_offsets() {
         .contains_quorum(&hex::decode(hash(0)).unwrap()));
 }
 
+/// A blocked Core RPC must leave the async runtime able to run other tasks.
 #[tokio::test(flavor = "current_thread")]
 async fn should_keep_the_async_runtime_responsive_during_blocking_core_calls() {
     let core = jameson();
-    core.state.lock().unwrap().delay = Duration::from_millis(30);
+    let (release, gate) = std::sync::mpsc::channel();
+    core.state.lock().unwrap().first_response_gate = Some(gate);
     let cache = Arc::new(QuorumCache::new(core.config.clone()));
-    let start = std::time::Instant::now();
     let refresh = tokio::spawn(async move { cache.refresh().await });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let elapsed = start.elapsed();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while core.state.lock().unwrap().calls.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // This runtime task must be able to release a Core RPC that is still blocked.
+    release.send(()).unwrap();
     refresh.await.unwrap().unwrap();
-    assert!(
-        elapsed < Duration::from_millis(150),
-        "async timers stalled for {elapsed:?} during blocking RPC"
-    );
 }
 
+/// Pre-activation historical samples must not prevent serving the first active keys.
 #[tokio::test]
 async fn should_serve_the_window_when_the_floor_precedes_platform_quorum_activation() {
     let core = MockCore::new(
@@ -680,9 +731,15 @@ async fn should_reject_a_historical_sample_missing_an_older_active_quorum() {
     let cache = QuorumCache::new(core.config.clone());
     cache.refresh().await.unwrap();
     let before = cache.get_previous_quorums().await.unwrap();
-    core.state.lock().unwrap().omit_at_height = Some(13223);
-    assert!(cache.refresh().await.is_err());
-    assert_eq!(cache.get_previous_quorums().await.unwrap(), before);
+    for omit_only in [None, Some(2)] {
+        {
+            let mut state = core.state.lock().unwrap();
+            state.omit_at_height = Some(13223);
+            state.omit_only = omit_only;
+        }
+        assert!(cache.refresh().await.is_err());
+        assert_eq!(cache.get_previous_quorums().await.unwrap(), before);
+    }
 }
 
 /// Readiness gives load balancers a failing status without changing health's HTTP status.
@@ -739,4 +796,97 @@ async fn should_publish_current_and_retry_the_window_when_the_tip_moves() {
     assert_eq!(floor, 13247);
     assert!(previous.contains_quorum(&hex::decode(hash(6)).unwrap()));
     assert!(cache.is_healthy().await);
+}
+
+/// Every legal mining-offset pair must leave no hole at the maximum allowed step.
+#[tokio::test]
+async fn should_cover_all_mining_offset_pairs_at_the_maximum_step() {
+    for first in 10..=18 {
+        for replacement in 10..=18 {
+            let starts: Vec<u32> = (0..20)
+                .map(|cycle| {
+                    cycle * 24
+                        + match cycle {
+                            0 => first,
+                            4 => replacement,
+                            _ => 10,
+                        }
+                })
+                .collect();
+            let quorums: Vec<Quorum> = starts
+                .iter()
+                .enumerate()
+                .map(|(i, &created)| Quorum {
+                    id: i as u32,
+                    created,
+                    retired: starts.get(i + 4).copied().unwrap_or(u32::MAX),
+                })
+                .collect();
+            let mut core = MockCore::new(250, quorums.clone());
+            core.config.quorum.retention_blocks = 288;
+            core.config.quorum.sample_step_blocks = Some(73);
+            core.config.validate_quorum().unwrap();
+            let cache = QuorumCache::new(core.config.clone());
+            for tip in [250u32, 299, 345] {
+                core.state.lock().unwrap().tip = tip;
+                cache.refresh().await.unwrap();
+                let (floor, window) = cache.get_previous_quorums().await.unwrap();
+                let expected: Vec<String> = quorums
+                    .iter()
+                    .filter(|q| q.created <= tip && q.retired > floor)
+                    .map(|q| hash(q.id))
+                    .collect();
+                let actual: Vec<String> =
+                    window.iter().map(|q| hex::encode(&q.quorum_hash)).collect();
+                assert_eq!(
+                    actual, expected,
+                    "mining offsets {first}/{replacement}, tip {tip}"
+                );
+            }
+        }
+    }
+}
+
+/// The legacy SDK JSON structs must accept actual endpoint responses unchanged.
+#[tokio::test]
+async fn should_deserialize_responses_into_legacy_sdk_types() {
+    #[derive(serde::Deserialize)]
+    struct QuorumData {
+        quorum_hash: String,
+        key: String,
+        height: u64,
+        valid_members_count: u32,
+    }
+    #[derive(serde::Deserialize)]
+    struct QuorumsResponse {
+        success: bool,
+        data: Vec<QuorumData>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PreviousQuorumsData {
+        height: u64,
+        quorums: Vec<QuorumData>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PreviousQuorumsResponse {
+        success: bool,
+        data: PreviousQuorumsData,
+    }
+    let core = jameson();
+    let cache = Arc::new(QuorumCache::new(core.config.clone()));
+    cache.refresh().await.unwrap();
+    let current: QuorumsResponse =
+        serde_json::from_value(endpoint(cache.clone(), core.config.clone(), "/quorums").await)
+            .unwrap();
+    assert!(current.success);
+    assert_eq!(current.data.len(), 4);
+    assert_eq!(current.data[0].quorum_hash, hash(2));
+    assert_eq!(current.data[0].key.len(), 96);
+    assert_eq!(current.data[0].height, 13190);
+    assert_eq!(current.data[0].valid_members_count, 12);
+    let previous: PreviousQuorumsResponse =
+        serde_json::from_value(endpoint(cache, core.config.clone(), "/previous").await).unwrap();
+    assert!(previous.success);
+    assert_eq!(previous.data.height, 13223);
+    assert_eq!(previous.data.quorums.len(), 5);
 }

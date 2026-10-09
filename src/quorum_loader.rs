@@ -266,6 +266,7 @@ pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult>
 mod tests {
     use super::*;
 
+    /// Key caching must remain bounded even when historical commitments accumulate.
     #[test]
     fn key_memo_is_bounded_and_evicts_oldest() {
         let mut memo = KeyMemo::default();
