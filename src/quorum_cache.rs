@@ -158,7 +158,7 @@ impl QuorumCache {
         }
     }
 
-    fn reload_due(&self, tip: u32) -> LoadResult<(bool, bool)> {
+    fn reload_due(&self, tip: u32) -> LoadResult<bool> {
         let state = self
             .state
             .read()
@@ -166,15 +166,12 @@ impl QuorumCache {
         Ok(match (&state.current, &state.previous) {
             (Some(current), Some(previous)) => {
                 let changed = current.height != tip;
-                (
-                    changed,
-                    changed
-                        || current.refreshed.elapsed() >= self.update_interval
-                        || previous.refreshed.elapsed() >= self.update_interval
-                        || previous.height != tip.saturating_sub(self.config.quorum_retention()),
-                )
+                changed
+                    || current.refreshed.elapsed() >= self.update_interval
+                    || previous.refreshed.elapsed() >= self.update_interval
+                    || previous.height != tip.saturating_sub(self.config.quorum_retention())
             }
-            _ => (true, true),
+            _ => true,
         })
     }
 
@@ -198,9 +195,7 @@ impl QuorumCache {
                     Ok(tip) => {
                         let new_tip = last_polled_tip.replace(tip) != Some(tip);
                         match self.reload_due(tip) {
-                            Ok((_, true))
-                                if new_tip || tokio::time::Instant::now() >= retry_after =>
-                            {
+                            Ok(true) if new_tip || tokio::time::Instant::now() >= retry_after => {
                                 match self.refresh().await {
                                     Ok(()) => {
                                         failures = 0;
@@ -216,8 +211,7 @@ impl QuorumCache {
                                     }
                                 }
                             }
-                            Ok((_, true)) => {}
-                            Ok((_, false)) => {}
+                            Ok(_) => {}
                             Err(error) => eprintln!("Cannot read quorum refresh state: {error}"),
                         }
                     }
@@ -286,6 +280,7 @@ mod tests {
         tokio::time::pause();
         cache.clone().start_background_refresh().await;
         tokio::task::yield_now().await;
+        // Wake the first interval tick; later polls retry exactly when now == retry_after.
         tokio::time::advance(Duration::from_millis(1)).await;
         let active_attempts = || {
             core.state
