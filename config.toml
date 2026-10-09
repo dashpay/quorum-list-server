@@ -1,3 +1,5 @@
+network = "testnet"
+
 [server]
 port = 8080
 host = "0.0.0.0"
@@ -9,6 +11,9 @@ password = "password"
 
 [quorum]
 previous_blocks_offset = 8
-
-[network]
-network = "testnet"
+retention_blocks = 48
+cache_ttl_seconds = 60
+poll_interval_seconds = 1
+max_entries = 90
+key_memo_max_entries = 180
+health_stale_intervals = 3

@@ -68,6 +68,15 @@ impl Network {
             Network::Regtest => 2443,
         }
     }
+
+    /// Platform LLMQ defaults from Dash Core's llmq/params.h.
+    pub fn platform_quorum_parameters(&self) -> (u32, u32) {
+        match self {
+            Network::Mainnet | Network::Testnet => (24, 24),
+            Network::Devnet => (4, 24),
+            Network::Regtest => (2, 24),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,14 +119,35 @@ pub struct RpcConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QuorumConfig {
     pub previous_blocks_offset: u32,
-    #[serde(default = "default_cache_ttl")]
     pub cache_ttl_seconds: u64,
+    pub retention_blocks: u32,
+    pub sample_step_blocks: Option<u32>,
+    pub active_quorum_count: Option<u32>,
+    pub dkg_interval: Option<u32>,
+    pub max_entries: usize,
+    pub key_memo_max_entries: usize,
+    pub poll_interval_seconds: u64,
+    pub health_stale_intervals: u32,
 }
 
-fn default_cache_ttl() -> u64 {
-    60
+impl Default for QuorumConfig {
+    fn default() -> Self {
+        Self {
+            previous_blocks_offset: 8,
+            cache_ttl_seconds: 60,
+            retention_blocks: 48,
+            sample_step_blocks: None,
+            active_quorum_count: None,
+            dkg_interval: None,
+            max_entries: 90,
+            key_memo_max_entries: 180,
+            poll_interval_seconds: 1,
+            health_stale_intervals: 3,
+        }
+    }
 }
 
 impl Default for Config {
@@ -132,10 +162,7 @@ impl Default for Config {
                 username: "dashrpc".to_string(),
                 password: "password".to_string(),
             },
-            quorum: QuorumConfig {
-                previous_blocks_offset: 8,
-                cache_ttl_seconds: default_cache_ttl(),
-            },
+            quorum: QuorumConfig::default(),
             network: Network::default(),
             docker: DockerConfig::default(),
         }
@@ -194,6 +221,33 @@ impl Config {
             }
         }
 
+        macro_rules! quorum_env {
+            ($name:literal, $field:ident) => {
+                if let Ok(value) = std::env::var($name) {
+                    config.quorum.$field = value
+                        .parse()
+                        .unwrap_or_else(|_| panic!("Invalid {}", $name));
+                }
+            };
+            ($name:literal, $field:ident, optional) => {
+                if let Ok(value) = std::env::var($name) {
+                    config.quorum.$field = Some(
+                        value
+                            .parse()
+                            .unwrap_or_else(|_| panic!("Invalid {}", $name)),
+                    );
+                }
+            };
+        }
+        quorum_env!("QUORUM_RETENTION_BLOCKS", retention_blocks);
+        quorum_env!("QUORUM_SAMPLE_STEP_BLOCKS", sample_step_blocks, optional);
+        quorum_env!("QUORUM_ACTIVE_QUORUM_COUNT", active_quorum_count, optional);
+        quorum_env!("QUORUM_DKG_INTERVAL", dkg_interval, optional);
+        quorum_env!("QUORUM_MAX_ENTRIES", max_entries);
+        quorum_env!("QUORUM_KEY_MEMO_MAX_ENTRIES", key_memo_max_entries);
+        quorum_env!("QUORUM_POLL_INTERVAL_SECONDS", poll_interval_seconds);
+        quorum_env!("QUORUM_HEALTH_STALE_INTERVALS", health_stale_intervals);
+
         if let Ok(network_str) = std::env::var("DASH_NETWORK") {
             config.network =
                 Network::try_from(network_str.as_str()).unwrap_or_else(|e| panic!("{}", e));
@@ -225,6 +279,42 @@ impl Config {
 
     pub fn get_llmq_type_id(&self) -> u32 {
         self.network.llmq_type_id()
+    }
+
+    pub fn quorum_sample_step(&self) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+        let (active, interval) = self.network.platform_quorum_parameters();
+        let active = self.quorum.active_quorum_count.unwrap_or(active);
+        let interval = self.quorum.dkg_interval.unwrap_or(interval);
+        let lifetime = active
+            .checked_mul(interval)
+            .filter(|value| *value > 0)
+            .ok_or(
+                "Quorum active count and DKG interval must be positive and their product fit u32",
+            )?;
+        // Commitment mining offsets can differ within a cycle, shortening an active run.
+        let max_step = (active - 1) * interval + 1;
+        let step = self
+            .quorum
+            .sample_step_blocks
+            .unwrap_or((lifetime / 2).min(max_step).max(1));
+        if step == 0 || step > max_step {
+            return Err(format!("Quorum sample step {step} must be between 1 and {max_step}: commitment mining offsets can shorten active runs").into());
+        }
+        if self.quorum.cache_ttl_seconds == 0
+            || self.quorum.poll_interval_seconds == 0
+            || self.quorum.health_stale_intervals == 0
+            || self.quorum.max_entries == 0
+            || self.quorum.key_memo_max_entries == 0
+        {
+            return Err("Quorum intervals and cache limits must be positive".into());
+        }
+        Ok(step)
+    }
+
+    pub fn quorum_retention(&self) -> u32 {
+        self.quorum
+            .retention_blocks
+            .max(self.quorum.previous_blocks_offset)
     }
 
     pub fn get_dapi_port(&self) -> u16 {
@@ -300,5 +390,88 @@ previous_blocks_offset = 8
         assert_eq!(config.network, Network::Devnet);
         assert_eq!(config.get_llmq_type(), "llmq_devnet_platform");
         assert_eq!(config.get_llmq_type_id(), 107);
+    }
+
+    #[test]
+    fn should_default_legacy_configs_to_a_safe_rolling_window() {
+        let quorum: QuorumConfig = toml::from_str("previous_blocks_offset = 8").unwrap();
+        assert_eq!(quorum.retention_blocks, 48);
+        assert_eq!(quorum.cache_ttl_seconds, 60);
+        assert_eq!(quorum.max_entries, 90);
+        for (network, expected) in [
+            (Network::Mainnet, 288),
+            (Network::Testnet, 288),
+            (Network::Devnet, 48),
+            (Network::Regtest, 24),
+        ] {
+            let mut config = Config {
+                network,
+                ..Config::default()
+            };
+            assert_eq!(config.quorum_sample_step().unwrap(), expected);
+            config.quorum.active_quorum_count = Some(1);
+            assert_eq!(config.quorum_sample_step().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_quorum_intervals_and_limits() {
+        let mut config = Config::default();
+        config.quorum.sample_step_blocks = Some(0);
+        assert!(config.quorum_sample_step().is_err());
+        config.quorum.sample_step_blocks = None;
+        config.quorum.active_quorum_count = Some(0);
+        assert!(config.quorum_sample_step().is_err());
+        config.quorum.active_quorum_count = Some(u32::MAX);
+        assert!(config.quorum_sample_step().is_err());
+        config.quorum.active_quorum_count = None;
+        config.quorum.cache_ttl_seconds = 0;
+        assert!(config.quorum_sample_step().is_err());
+    }
+
+    #[test]
+    fn should_preserve_quorum_env_fallbacks() {
+        let variables = [
+            ("QUORUM_PREVIOUS_BLOCKS_OFFSET", "96"),
+            ("QUORUM_CACHE_TTL_SECONDS", "1"),
+            ("QUORUM_RETENTION_BLOCKS", "720"),
+            ("QUORUM_SAMPLE_STEP_BLOCKS", "12"),
+            ("QUORUM_ACTIVE_QUORUM_COUNT", "4"),
+            ("QUORUM_DKG_INTERVAL", "24"),
+            ("QUORUM_MAX_ENTRIES", "80"),
+            ("QUORUM_KEY_MEMO_MAX_ENTRIES", "160"),
+            ("QUORUM_POLL_INTERVAL_SECONDS", "2"),
+            ("QUORUM_HEALTH_STALE_INTERVALS", "5"),
+        ];
+        let original: Vec<_> = variables
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in variables {
+            std::env::set_var(name, value);
+        }
+        let config = Config::load_from_env_or_file("/nonexistent/qls16-config.toml");
+        for (name, value) in original {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        assert_eq!(config.quorum.previous_blocks_offset, 96);
+        assert_eq!(config.quorum.cache_ttl_seconds, 1);
+        assert_eq!(config.quorum_retention(), 720);
+        assert_eq!(config.quorum_sample_step().unwrap(), 12);
+        assert_eq!(config.quorum.max_entries, 80);
+        assert_eq!(config.quorum.key_memo_max_entries, 160);
+        assert_eq!(config.quorum.poll_interval_seconds, 2);
+        assert_eq!(config.quorum.health_stale_intervals, 5);
+    }
+
+    #[test]
+    fn should_load_the_shipped_config_file() {
+        let config: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        assert_eq!(config.network, Network::Testnet);
+        assert_eq!(config.quorum_sample_step().unwrap(), 288);
     }
 }

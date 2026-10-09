@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(result["success"], false);
         assert!(result.get("lastUpdated").is_none());
         let health = response(config, cache, "/health").await;
-        assert_eq!(health["success"], true);
+        assert_eq!(health["success"], false);
         assert!(health.get("lastUpdated").is_none());
     }
 }

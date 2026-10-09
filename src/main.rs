@@ -9,6 +9,9 @@ mod masternode_loader;
 mod masternode_cache;
 mod grpc_client;
 
+#[cfg(test)]
+mod quorum_cache_tests;
+
 use config::Config;
 use masternode_cache::MasternodeCache;
 use quorum_cache::QuorumCache;
@@ -21,6 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration
     let config = Config::load_from_env_or_file("config.toml");
+    if let Err(error) = config.quorum_sample_step() {
+        eprintln!("Invalid quorum configuration: {error}");
+        return Err(std::io::Error::other(error.to_string()).into());
+    }
     println!("Configuration loaded:");
     println!("  Server: {}:{}", config.server.host, config.server.port);
     println!("  RPC: {} (user: {})", config.rpc.url, config.rpc.username);

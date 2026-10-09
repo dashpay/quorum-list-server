@@ -1,16 +1,27 @@
 use crate::config::Config;
 use crate::quorum_list::QuorumList;
-use crate::quorum_loader;
-use chrono::Local;
-use std::sync::{Arc, RwLock};
+use crate::quorum_loader::{self, KeyMemo, LoadResult, REFRESH_TIMEOUT};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+
+#[derive(Clone)]
+pub struct QuorumSnapshot {
+    pub quorums: QuorumList,
+    pub height: u32,
+    pub last_updated: i64,
+    refreshed: Instant,
+}
+
+#[derive(Default)]
+struct CacheState {
+    current: Option<QuorumSnapshot>,
+    previous: Option<QuorumSnapshot>,
+}
 
 pub struct QuorumCache {
-    current_quorums: Arc<RwLock<Option<QuorumList>>>,
-    previous_quorums: Arc<RwLock<Option<(u32, QuorumList)>>>,
-    current_last_update: Arc<Mutex<Option<Instant>>>,
-    previous_last_update: Arc<Mutex<Option<Instant>>>,
+    state: RwLock<CacheState>,
+    memo: Arc<Mutex<KeyMemo>>,
+    rpc_worker: Arc<tokio::sync::Mutex<()>>,
     config: Arc<Config>,
     update_interval: Duration,
 }
@@ -19,170 +30,164 @@ impl QuorumCache {
     pub fn new(config: Config) -> Self {
         let ttl = config.quorum.cache_ttl_seconds;
         Self {
-            current_quorums: Arc::new(RwLock::new(None)),
-            previous_quorums: Arc::new(RwLock::new(None)),
-            current_last_update: Arc::new(Mutex::new(None)),
-            previous_last_update: Arc::new(Mutex::new(None)),
+            state: RwLock::new(CacheState::default()),
+            memo: Arc::new(Mutex::new(KeyMemo::default())),
+            rpc_worker: Arc::new(tokio::sync::Mutex::new(())),
             config: Arc::new(config),
             update_interval: Duration::from_secs(ttl),
         }
     }
 
-    /// Read the cached current quorums.
-    ///
-    /// This never contacts Dash Core: the background refresh task is the only
-    /// writer. Serving a request must not depend on RPC latency.
-    pub async fn get_quorums(
-        &self,
-    ) -> Result<QuorumList, Box<dyn std::error::Error + Send + Sync>> {
-        let data = self
-            .current_quorums
+    /// Reads the list and its metadata together without contacting Core.
+    pub async fn get_snapshot(&self) -> LoadResult<QuorumSnapshot> {
+        self.state
+            .read()
+            .map_err(|_| "Failed to read quorum cache")?
+            .current
+            .clone()
+            .ok_or_else(|| "Quorum cache is not populated yet".into())
+    }
+
+    pub async fn get_quorums(&self) -> LoadResult<QuorumList> {
+        Ok(self.get_snapshot().await?.quorums)
+    }
+
+    /// Returns the rolling union and the lowest sampled Core height.
+    pub async fn get_previous_quorums(&self) -> LoadResult<(u32, QuorumList)> {
+        let state = self
+            .state
             .read()
             .map_err(|_| "Failed to read quorum cache")?;
-        Ok(data
+        let previous = state
+            .previous
             .as_ref()
-            .ok_or("Quorum cache is not populated yet")?
-            .clone())
+            .ok_or("Previous quorum cache is not populated yet")?;
+        Ok((previous.height, previous.quorums.clone()))
     }
 
-    /// Read the cached previous quorums along with the height they were taken at.
-    ///
-    /// As with [`Self::get_quorums`], this is a pure cache read.
-    pub async fn get_previous_quorums(
-        &self,
-    ) -> Result<(u32, QuorumList), Box<dyn std::error::Error + Send + Sync>> {
-        let data = self
-            .previous_quorums
-            .read()
-            .map_err(|_| "Failed to read previous quorum cache")?;
-        Ok(data
-            .as_ref()
-            .ok_or("Previous quorum cache is not populated yet")?
-            .clone())
+    /// The permit remains with the blocking worker even if its async waiter times out.
+    async fn rpc_work<T, F>(&self, work: F) -> LoadResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> LoadResult<T> + Send + 'static,
+    {
+        tokio::time::timeout(REFRESH_TIMEOUT, async {
+            let permit = self.rpc_worker.clone().lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                work()
+            })
+            .await?
+        })
+        .await
+        .map_err(|_| "Quorum RPC worker timed out")?
     }
 
-    /// Refresh both quorum caches from Dash Core.
-    ///
-    /// Called once at startup and then only by the background refresh task.
-    pub async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.update_current_cache().await?;
-        self.update_previous_cache().await?;
-        Ok(())
-    }
-
-    async fn update_current_cache(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        println!("Updating quorum cache...");
-
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            quorum_loader::load_initial_quorums(&self.config),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(quorums)) => {
-                {
-                    let mut data = self
-                        .current_quorums
-                        .write()
-                        .map_err(|_| "Failed to write to quorum cache")?;
-                    *data = Some(quorums);
-                }
-                {
-                    let mut last_update = self.current_last_update.lock().await;
-                    *last_update = Some(Instant::now());
-                }
-                println!("Quorum cache updated successfully");
-                Ok(())
+    /// Both lists are attempted; failures preserve each list's last good snapshot.
+    pub async fn refresh(&self) -> LoadResult<()> {
+        let config = self.config.clone();
+        let memo = self.memo.clone();
+        let result = self
+            .rpc_work(move || {
+                let mut memo = memo.lock().map_err(|_| "Failed to lock quorum key memo")?;
+                quorum_loader::refresh(&config, &mut memo)
+            })
+            .await?;
+        let now = Instant::now();
+        let last_updated = chrono::Utc::now().timestamp();
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "Failed to write quorum cache")?;
+        let current_error = match result.current {
+            Ok(quorums) => {
+                state.current = Some(QuorumSnapshot {
+                    quorums,
+                    height: result.tip,
+                    last_updated,
+                    refreshed: now,
+                });
+                None
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                eprintln!("Quorum cache update timed out after 30 seconds");
-                Err("Quorum cache update timed out after 30 seconds".into())
-            }
-        }
-    }
-
-    async fn update_previous_cache(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        println!("Updating previous quorum cache...");
-
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            self.fetch_previous_quorums(),
-        )
-        .await;
-
-        match result {
-            Ok(Ok((height, quorums))) => {
-                {
-                    let mut data = self
-                        .previous_quorums
-                        .write()
-                        .map_err(|_| "Failed to write to previous quorum cache")?;
-                    *data = Some((height, quorums));
-                }
-                {
-                    let mut last_update = self.previous_last_update.lock().await;
-                    *last_update = Some(Instant::now());
-                }
-                println!("Previous quorum cache updated successfully (height: {})", height);
-                Ok(())
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                eprintln!("Previous quorum cache update timed out after 30 seconds");
-                Err("Previous quorum cache update timed out after 30 seconds".into())
-            }
-        }
-    }
-
-    async fn fetch_previous_quorums(
-        &self,
-    ) -> Result<(u32, QuorumList), Box<dyn std::error::Error + Send + Sync>> {
-        let current_height = quorum_loader::get_current_block_height(&self.config).await?;
-        let previous_height = if current_height >= self.config.quorum.previous_blocks_offset {
-            current_height - self.config.quorum.previous_blocks_offset
-        } else {
-            0
+            Err(error) => Some(error),
         };
-        let quorums = quorum_loader::load_quorums_at_height(&self.config, previous_height).await?;
-        Ok((previous_height, quorums))
+        let previous_error = match result.previous {
+            Ok((height, quorums)) => {
+                state.previous = Some(QuorumSnapshot {
+                    quorums,
+                    height,
+                    last_updated,
+                    refreshed: now,
+                });
+                None
+            }
+            Err(error) => Some(error),
+        };
+        match (current_error, previous_error) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(error),
+            (Some(current), Some(previous)) => {
+                Err(format!("Current quorums: {current}; rolling window: {previous}").into())
+            }
+        }
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        let stale_after = self
+            .update_interval
+            .saturating_mul(self.config.quorum.health_stale_intervals);
+        let Ok(state) = self.state.read() else {
+            return false;
+        };
+        match (&state.current, &state.previous) {
+            (Some(current), Some(previous)) => {
+                current.refreshed.elapsed() < stale_after
+                    && previous.refreshed.elapsed() < stale_after
+            }
+            _ => false,
+        }
+    }
+
+    fn reload_due(&self, tip: u32) -> LoadResult<bool> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| "Failed to read quorum cache")?;
+        Ok(match (&state.current, &state.previous) {
+            (Some(current), Some(previous)) => {
+                current.height != tip
+                    || current.refreshed.elapsed() >= self.update_interval
+                    || previous.refreshed.elapsed() >= self.update_interval
+                    || previous.height != tip.saturating_sub(self.config.quorum_retention())
+            }
+            _ => true,
+        })
     }
 
     pub async fn start_background_refresh(self: Arc<Self>) {
         tokio::spawn(async move {
+            let poll_interval = Duration::from_secs(self.config.quorum.poll_interval_seconds)
+                .min(self.update_interval)
+                .max(Duration::from_millis(1));
+            let mut poll = tokio::time::interval(poll_interval);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::time::sleep(self.update_interval).await;
-                let now = Local::now();
-                println!(
-                    "🔄 [{}] Background refresh: Starting quorum cache update...",
-                    now.format("%Y-%m-%d %H:%M:%S")
-                );
-
-                let current_result = self.update_current_cache().await;
-                let previous_result = self.update_previous_cache().await;
-
-                match (current_result, previous_result) {
-                    (Ok(_), Ok(_)) => println!(
-                        "✅ [{}] Background refresh: Quorum caches updated successfully",
-                        Local::now().format("%Y-%m-%d %H:%M:%S")
-                    ),
-                    (Err(e1), Err(e2)) => eprintln!(
-                        "❌ [{}] Background refresh: Failed to update quorum caches: current={}, previous={}",
-                        Local::now().format("%Y-%m-%d %H:%M:%S"),
-                        e1,
-                        e2
-                    ),
-                    (Err(e), Ok(_)) => eprintln!(
-                        "⚠️  [{}] Background refresh: Failed to update current quorum cache: {}",
-                        Local::now().format("%Y-%m-%d %H:%M:%S"),
-                        e
-                    ),
-                    (Ok(_), Err(e)) => eprintln!(
-                        "⚠️  [{}] Background refresh: Failed to update previous quorum cache: {}",
-                        Local::now().format("%Y-%m-%d %H:%M:%S"),
-                        e
-                    ),
+                poll.tick().await;
+                let config = self.config.clone();
+                match self
+                    .rpc_work(move || quorum_loader::get_current_block_height(&config))
+                    .await
+                {
+                    Ok(tip) => match self.reload_due(tip) {
+                        Ok(true) => {
+                            if let Err(error) = self.refresh().await {
+                                eprintln!("Quorum refresh failed: {error}");
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => eprintln!("Cannot read quorum refresh state: {error}"),
+                    },
+                    Err(error) => eprintln!("Core tip poll failed: {error}"),
                 }
             }
         });
