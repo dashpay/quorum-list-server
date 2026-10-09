@@ -26,7 +26,4 @@ USER appuser
 
 EXPOSE 3000
 
-ENV API_HOST=0.0.0.0
-ENV API_PORT=3000
-
 CMD ["quorum-list-server"]

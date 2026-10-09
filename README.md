@@ -228,6 +228,8 @@ docker run --rm -p 8080:8080 \
 ```
 
 The server reads `/app/config.toml` first, then applies environment overrides.
+The image does not set `API_HOST` or `API_PORT`; the binary defaults to `0.0.0.0:3000`
+when neither the file nor explicitly supplied environment variables configure them.
 
 ## API Examples
 
