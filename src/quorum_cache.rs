@@ -70,14 +70,14 @@ impl QuorumCache {
         Ok((previous.height, previous.quorums.clone()))
     }
 
-    /// The permit remains with the blocking worker even if its async waiter times out.
+    /// Admission shares the timeout, while detached blocking work retains its permit.
     async fn rpc_work<T, F>(&self, work: F) -> LoadResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> LoadResult<T> + Send + 'static,
     {
-        let permit = self.rpc_worker.clone().lock_owned().await;
         tokio::time::timeout(REFRESH_TIMEOUT, async {
+            let permit = self.rpc_worker.clone().lock_owned().await;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 work()
@@ -245,6 +245,117 @@ impl QuorumCache {
 mod tests {
     use super::*;
     use crate::quorum_cache_tests::{MockCore, Quorum};
+
+    /// A stuck active worker must bound history admission and never publish its detached result.
+    #[tokio::test]
+    async fn should_return_when_a_timed_out_active_worker_blocks_window_admission() {
+        let core = MockCore::new(
+            100,
+            vec![Quorum {
+                id: 1,
+                created: 10,
+                retired: u32::MAX,
+            }],
+        );
+        let cache = Arc::new(QuorumCache::new(core.config.clone()));
+        cache.refresh().await.unwrap();
+        let current = cache.get_snapshot().await.unwrap();
+        let previous = cache.state.read().unwrap().previous.clone().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        {
+            let mut state = core.state.lock().unwrap();
+            state.tip = 101;
+            state.quorums.push(Quorum {
+                id: 2,
+                created: 101,
+                retired: u32::MAX,
+            });
+            state.historical_response_gate = Some((101, gate));
+            state.calls.clear();
+        }
+        let mut refresh = Box::pin(cache.refresh());
+        assert!(futures::poll!(&mut refresh).is_pending());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !core
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call["params"][0] == "listextended" && call["params"][1] == 101)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the active worker did not reach its gated response"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        let active_budget = tokio::time::sleep(REFRESH_TIMEOUT);
+        tokio::time::advance(REFRESH_TIMEOUT + Duration::from_secs(1)).await;
+        active_budget.await;
+        // Keep the active response gated through the window's separate admission budget.
+        let result = {
+            let result =
+                tokio::time::timeout(REFRESH_TIMEOUT + Duration::from_secs(1), &mut refresh);
+            tokio::pin!(result);
+            // Poll the expired active stage to start the window's admission timeout.
+            assert!(futures::poll!(&mut result).is_pending());
+            tokio::time::advance(REFRESH_TIMEOUT + Duration::from_secs(2)).await;
+            result.await
+        };
+        drop(refresh);
+        assert!(
+            cache.rpc_worker.try_lock().is_err(),
+            "the active worker must still own the permit through both stage timeouts"
+        );
+        assert_eq!(core.state.lock().unwrap().calls.len(), 2);
+        release
+            .send(())
+            .expect("the active response must stay gated through the admission timeout");
+        let error = result
+            .expect("refresh hung waiting for a timed-out active worker's permit")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Current quorums: Quorum RPC worker timed out; rolling window: Quorum RPC worker timed out"));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while cache.rpc_worker.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached active worker did not finish after release"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(core.info_calls().len(), 1);
+        let snapshot = cache.get_snapshot().await.unwrap();
+        assert_eq!(snapshot.height, current.height);
+        assert_eq!(snapshot.quorums, current.quorums);
+        assert_eq!(snapshot.refreshed, current.refreshed);
+        assert_eq!(
+            cache.get_previous_quorums().await.unwrap(),
+            (previous.height, previous.quorums)
+        );
+        assert_eq!(
+            cache
+                .state
+                .read()
+                .unwrap()
+                .previous
+                .as_ref()
+                .unwrap()
+                .refreshed,
+            previous.refreshed
+        );
+        assert!(cache.is_healthy().await);
+        tokio::time::advance(
+            Duration::from_secs(core.config.quorum.cache_ttl_seconds)
+                .saturating_mul(core.config.quorum.health_stale_intervals),
+        )
+        .await;
+        assert!(!cache.is_healthy().await);
+    }
 
     /// A timed-out window waiter cannot release its worker permit or publish detached history.
     #[tokio::test]
