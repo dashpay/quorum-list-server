@@ -435,7 +435,7 @@ async fn should_report_the_core_height_on_quorums() {
     );
 }
 
-/// Core failures must preserve data and become visible through health and readiness.
+/// Window failures preserve trusted data and degrade readiness only once history is stale.
 #[tokio::test]
 async fn should_keep_last_good_window_and_report_degraded_health_on_core_failure() {
     let mut core = jameson();
@@ -443,14 +443,52 @@ async fn should_keep_last_good_window_and_report_degraded_health_on_core_failure
     let cache = Arc::new(QuorumCache::new(core.config.clone()));
     cache.refresh().await.unwrap();
     let before = endpoint(cache.clone(), core.config.clone(), "/previous").await;
-    core.state.lock().unwrap().fail = true;
+    core.state.lock().unwrap().fail_height = Some(13223);
     assert!(cache.refresh().await.is_err());
     assert_eq!(
         before,
         endpoint(cache.clone(), core.config.clone(), "/previous").await
     );
+    assert_eq!(
+        endpoint(cache.clone(), core.config.clone(), "/ready").await["success"],
+        true,
+        "one failed window must not reject still-fresh trusted data"
+    );
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(3)).await;
+    {
+        let mut state = core.state.lock().unwrap();
+        state.tip = 13272;
+        state.fail_height = Some(13224);
+        state.quorums.push(Quorum {
+            id: 6,
+            created: 13272,
+            retired: u32::MAX,
+        });
+    }
+    let refreshing = cache.clone();
+    let refresh = tokio::spawn(async move { refreshing.refresh().await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !refresh.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refresh did not finish"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(refresh.await.unwrap().is_err());
+    assert!(
+        cache
+            .get_quorums()
+            .await
+            .unwrap()
+            .contains_quorum(&hex::decode(hash(6)).unwrap()),
+        "current keys must refresh even while history remains stale"
+    );
+    assert_eq!(
+        before,
+        endpoint(cache.clone(), core.config.clone(), "/previous").await
+    );
     let ready = endpoint(cache.clone(), core.config.clone(), "/ready").await;
     assert_eq!(ready["success"], false);
     let health = endpoint(cache, core.config.clone(), "/health").await;
@@ -623,7 +661,7 @@ async fn should_publish_current_when_the_window_times_out() {
     );
     assert_eq!(cache.get_snapshot().await.unwrap().height, 13272);
     assert_eq!(cache.get_previous_quorums().await.unwrap(), previous);
-    assert!(!cache.is_healthy().await);
+    assert!(cache.is_healthy().await);
 }
 
 /// Late verification errors must preserve history without discarding new signing keys.
@@ -661,7 +699,7 @@ async fn should_publish_current_when_the_final_tip_verification_fails() {
         );
         assert_eq!(cache.get_snapshot().await.unwrap().height, 13272);
         assert_eq!(cache.get_previous_quorums().await.unwrap(), previous);
-        assert!(!cache.is_healthy().await);
+        assert!(cache.is_healthy().await);
         core.state.lock().unwrap().fail_block_count_at = None;
         cache.refresh().await.unwrap();
         assert!(cache.is_healthy().await);

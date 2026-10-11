@@ -17,7 +17,6 @@ pub struct QuorumSnapshot {
 struct CacheState {
     current: Option<QuorumSnapshot>,
     previous: Option<QuorumSnapshot>,
-    previous_failed: bool,
 }
 
 pub struct QuorumCache {
@@ -137,7 +136,6 @@ impl QuorumCache {
             .state
             .write()
             .map_err(|_| "Failed to write quorum cache")?;
-        state.previous_failed = previous.is_err();
         let previous_error = match previous {
             Ok((height, quorums)) => {
                 state.previous = Some(QuorumSnapshot {
@@ -169,8 +167,7 @@ impl QuorumCache {
         };
         match (&state.current, &state.previous) {
             (Some(current), Some(previous)) => {
-                !state.previous_failed
-                    && current.refreshed.elapsed() < stale_after
+                current.refreshed.elapsed() < stale_after
                     && previous.refreshed.elapsed() < stale_after
             }
             _ => false,

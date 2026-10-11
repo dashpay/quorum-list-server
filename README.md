@@ -92,9 +92,8 @@ once at the new tip. Repeated failed window reloads back off up to the smaller o
 30 seconds and the TTL; a newly observed tip bypasses this backoff.
 
 `/health` still returns HTTP 200 and the same JSON shape;
-it returns `success:false`, `data:null` and a degraded message when the latest
-window refresh failed, either list has never loaded, or its last successful
-refresh is older than
+it returns `success:false`, `data:null` and a degraded message when either list
+has never loaded or its last successful refresh is older than
 `cache_ttl_seconds * health_stale_intervals` (three intervals by default). `/ready`
 returns the same body with HTTP 503 while degraded and HTTP 200 when fresh, so
 load balancers can use it without changing existing `/health` matchers.
