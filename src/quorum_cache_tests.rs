@@ -33,6 +33,7 @@ pub struct CoreState {
     pub historical_response_gate: Option<(u32, std::sync::mpsc::Receiver<()>)>,
     pub fail_block_count_at: Option<usize>,
     pub creation_heights: std::collections::HashMap<u32, u32>,
+    pub commitment_change_on_info: Option<(u32, u32)>,
 }
 
 pub struct MockCore {
@@ -71,6 +72,7 @@ impl MockCore {
             historical_response_gate: None,
             fail_block_count_at: None,
             creation_heights: std::collections::HashMap::new(),
+            commitment_change_on_info: None,
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -165,8 +167,15 @@ impl MockCore {
                 } else {
                     let id = u32::from_str_radix(&request["params"][2].as_str().unwrap()[56..], 16)
                         .unwrap();
+                    if state
+                        .commitment_change_on_info
+                        .is_some_and(|(quorum, _)| quorum == id)
+                    {
+                        let (_, commitment) = state.commitment_change_on_info.take().unwrap();
+                        state.commitments.insert(id, commitment);
+                    }
                     let commitment = state.commitments.get(&id).copied().unwrap_or(0);
-                    json!({"quorumPublicKey": format!("{:02x}", 17 + commitment).repeat(48)})
+                    json!({"quorumPublicKey": format!("{:02x}", 17 + commitment).repeat(48), "minedBlock":hash(id + 100000 + commitment)})
                 };
                 let body = if failed {
                     json!({"result":null, "error":{"code":-1,"message":"Core unavailable"}, "id":request["id"]})

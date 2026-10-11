@@ -130,6 +130,9 @@ fn load_at_height(
                     if key.len() != 48 {
                         return Err("Invalid quorum public key length".into());
                     }
+                    if info.get("minedBlock").and_then(Value::as_str) != Some(mined_hash) {
+                        return Err("Quorum commitment changed during key lookup".into());
+                    }
                     memo.insert(memo_key, key.clone(), config.quorum.key_memo_max_entries);
                     key
                 }
@@ -276,6 +279,47 @@ pub fn refresh_previous(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quorum_cache_tests::{hash, MockCore, Quorum};
+
+    /// A fork switch during key lookup must not memoize the replacement under the old commitment.
+    #[test]
+    fn should_reject_a_commitment_change_between_list_and_info_without_memoizing() {
+        let core = MockCore::new(
+            100,
+            vec![Quorum {
+                id: 1,
+                created: 10,
+                retired: u32::MAX,
+            }],
+        );
+        core.state.lock().unwrap().commitment_change_on_info = Some((1, 1));
+        let mut memo = KeyMemo::default();
+        let result = refresh_current(&core.config, &mut memo).unwrap();
+        let error = result.current.expect_err(
+            "the info key belongs to a different mined commitment than the listed quorum",
+        );
+        assert!(error.to_string().contains("commitment changed"));
+        assert!(
+            memo.keys.is_empty(),
+            "the mismatched commitment must not populate the memo"
+        );
+        assert!(memo.order.is_empty());
+        core.state.lock().unwrap().commitments.clear();
+        let restored = refresh_current(&core.config, &mut memo)
+            .unwrap()
+            .current
+            .unwrap();
+        assert_eq!(
+            restored
+                .get_entry(&hex::decode(hash(1)).unwrap())
+                .unwrap()
+                .key,
+            vec![17; 48],
+            "returning to the original fork must fetch its original key"
+        );
+        assert_eq!(core.info_calls().len(), 2);
+        assert_eq!(memo.keys.len(), 1);
+    }
 
     /// Key caching must remain bounded even when historical commitments accumulate.
     #[test]
