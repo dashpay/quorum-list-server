@@ -1,5 +1,6 @@
 use crate::config::{Config, Network};
 use crate::quorum_cache::QuorumCache;
+use crate::quorum_loader::LATEST_MINING_OFFSET;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -34,6 +35,7 @@ pub struct CoreState {
     pub fail_block_count_at: Option<usize>,
     pub creation_heights: std::collections::HashMap<u32, u32>,
     pub commitment_change_on_info: Option<(u32, u32)>,
+    pub omit_info_mined_block: bool,
 }
 
 pub struct MockCore {
@@ -73,6 +75,7 @@ impl MockCore {
             fail_block_count_at: None,
             creation_heights: std::collections::HashMap::new(),
             commitment_change_on_info: None,
+            omit_info_mined_block: false,
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -175,7 +178,11 @@ impl MockCore {
                         state.commitments.insert(id, commitment);
                     }
                     let commitment = state.commitments.get(&id).copied().unwrap_or(0);
-                    json!({"quorumPublicKey": format!("{:02x}", 17 + commitment).repeat(48), "minedBlock":hash(id + 100000 + commitment)})
+                    let mut info = json!({"quorumPublicKey": format!("{:02x}", 17 + commitment).repeat(48), "minedBlock":hash(id + 100000 + commitment)});
+                    if state.omit_info_mined_block {
+                        info.as_object_mut().unwrap().remove("minedBlock");
+                    }
+                    info
                 };
                 let body = if failed {
                     json!({"result":null, "error":{"code":-1,"message":"Core unavailable"}, "id":request["id"]})
@@ -195,7 +202,7 @@ impl MockCore {
                 };
                 drop(state);
                 if let Some(gate) = gate {
-                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                    let _ = gate.recv_timeout(Duration::from_secs(30));
                 }
                 std::thread::sleep(delay);
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
@@ -629,7 +636,7 @@ async fn should_publish_current_when_the_window_times_out() {
     }
     let refreshing = cache.clone();
     let refresh = tokio::spawn(async move { refreshing.refresh().await });
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !core
         .state
         .lock()
@@ -647,7 +654,9 @@ async fn should_publish_current_when_the_window_times_out() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
     let result = refresh.await.unwrap();
-    release.send(()).unwrap();
+    release
+        .send(())
+        .expect("the gated historical RPC must still be waiting after the async timeout");
     assert!(result.unwrap_err().to_string().contains("timed out"));
     let current = endpoint(cache.clone(), core.config.clone(), "/quorums").await;
     assert_eq!(current["success"], true);
@@ -1049,8 +1058,8 @@ async fn should_publish_current_and_retry_the_window_when_the_tip_moves() {
 /// Every legal mining-offset pair must leave no hole at the maximum allowed step.
 #[tokio::test]
 async fn should_cover_all_mining_offset_pairs_at_the_maximum_step() {
-    for first in 10..=18 {
-        for replacement in 10..=18 {
+    for first in 10..=LATEST_MINING_OFFSET {
+        for replacement in 10..=LATEST_MINING_OFFSET {
             let starts: Vec<u32> = (0..20)
                 .map(|cycle| {
                     cycle * 24

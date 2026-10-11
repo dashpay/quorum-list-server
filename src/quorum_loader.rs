@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 pub type LoadResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+// Platform quorum commitments are mined at offsets 10..18 after the DKG base height.
+pub const LATEST_MINING_OFFSET: u32 = 18;
 
 /// Only immutable public keys are memoized; membership always comes from Core.
 #[derive(Default)]
@@ -130,7 +132,11 @@ fn load_at_height(
                     if key.len() != 48 {
                         return Err("Invalid quorum public key length".into());
                     }
-                    if info.get("minedBlock").and_then(Value::as_str) != Some(mined_hash) {
+                    let info_mined_hash = info
+                        .get("minedBlock")
+                        .and_then(Value::as_str)
+                        .ok_or("Missing quorum minedBlock")?;
+                    if info_mined_hash != mined_hash {
                         return Err("Quorum commitment changed during key lookup".into());
                     }
                     memo.insert(memo_key, key.clone(), config.quorum.key_memo_max_entries);
@@ -195,7 +201,8 @@ fn load_window(
             Ok(list) => {
                 // A quorum observed later was already active after its latest mining height.
                 for entry in active.iter().chain(window.iter()) {
-                    if u64::from(entry.height) + 18 <= u64::from(height)
+                    if u64::from(entry.height) + u64::from(LATEST_MINING_OFFSET)
+                        <= u64::from(height)
                         && !list.contains_quorum(&entry.quorum_hash)
                     {
                         return Err(
@@ -280,6 +287,28 @@ pub fn refresh_previous(
 mod tests {
     use super::*;
     use crate::quorum_cache_tests::{hash, MockCore, Quorum};
+
+    /// Missing commitment identity must be reported separately from a detected fork switch.
+    #[test]
+    fn should_report_a_missing_info_mined_block_without_memoizing() {
+        let core = MockCore::new(
+            100,
+            vec![Quorum {
+                id: 1,
+                created: 10,
+                retired: u32::MAX,
+            }],
+        );
+        core.state.lock().unwrap().omit_info_mined_block = true;
+        let mut memo = KeyMemo::default();
+        let error = refresh_current(&core.config, &mut memo)
+            .unwrap()
+            .current
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Missing quorum minedBlock");
+        assert!(memo.keys.is_empty());
+        assert!(memo.order.is_empty());
+    }
 
     /// A fork switch during key lookup must not memoize the replacement under the old commitment.
     #[test]

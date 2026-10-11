@@ -246,9 +246,9 @@ mod tests {
     use super::*;
     use crate::quorum_cache_tests::{MockCore, Quorum};
 
-    /// A timed-out waiter cannot release its worker permit or publish the detached result.
+    /// A timed-out window waiter cannot release its worker permit or publish detached history.
     #[tokio::test]
-    async fn should_hold_the_rpc_permit_after_the_active_waiter_times_out() {
+    async fn should_hold_the_rpc_permit_after_the_window_waiter_times_out() {
         let core = MockCore::new(
             100,
             vec![Quorum {
@@ -258,29 +258,30 @@ mod tests {
             }],
         );
         let (release_first, first_gate) = std::sync::mpsc::channel();
-        core.state.lock().unwrap().first_response_gate = Some(first_gate);
+        core.state.lock().unwrap().historical_response_gate = Some((52, first_gate));
         let cache = Arc::new(QuorumCache::new(core.config.clone()));
         let first_cache = cache.clone();
-        let first = tokio::spawn(async move {
-            first_cache
-                .quorum_work(quorum_loader::refresh_current)
-                .await
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while core.state.lock().unwrap().calls.is_empty() {
+        let first = tokio::spawn(async move { first_cache.refresh().await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !core
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call["params"][0] == "listextended" && call["params"][1] == 52)
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "first worker did not start"
+                "first window worker did not start"
             );
             tokio::task::yield_now().await;
         }
+        let published_current = cache.get_snapshot().await.unwrap();
+        let gated_call_count = core.state.lock().unwrap().calls.len();
         tokio::time::pause();
         tokio::time::advance(REFRESH_TIMEOUT + Duration::from_secs(1)).await;
-        let error = first
-            .await
-            .unwrap()
-            .err()
-            .expect("the first RPC waiter must time out");
+        let error = first.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(
             cache.rpc_worker.try_lock().is_err(),
@@ -290,8 +291,7 @@ mod tests {
         let (release_second, second_gate) = std::sync::mpsc::channel();
         {
             let mut state = core.state.lock().unwrap();
-            state.tip = 101;
-            state.historical_response_gate = Some((101, second_gate));
+            state.historical_response_gate = Some((100, second_gate));
         }
         let second_cache = cache.clone();
         let (started, starting) = tokio::sync::oneshot::channel();
@@ -301,18 +301,26 @@ mod tests {
         });
         starting.await.unwrap();
         assert!(!second.is_finished());
-        assert_eq!(core.state.lock().unwrap().calls.len(), 1);
-        assert!(cache.get_snapshot().await.is_err());
+        assert_eq!(core.state.lock().unwrap().calls.len(), gated_call_count);
+        assert_eq!(
+            cache.get_snapshot().await.unwrap().refreshed,
+            published_current.refreshed
+        );
+        assert!(cache.get_previous_quorums().await.is_err());
 
-        release_first.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !core
+        release_first
+            .send(())
+            .expect("the first window RPC must still be gated after its waiter timed out");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while core
             .state
             .lock()
             .unwrap()
             .calls
             .iter()
-            .any(|call| call["params"][0] == "listextended" && call["params"][1] == 101)
+            .filter(|call| call["params"][0] == "listextended" && call["params"][1] == 100)
+            .count()
+            < 2
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -322,13 +330,17 @@ mod tests {
         }
         // The first closure completed successfully; the second result is still gated.
         assert_eq!(core.info_calls().len(), 1);
+        let current = cache.get_snapshot().await.unwrap();
+        assert_eq!(current.refreshed, published_current.refreshed);
+        assert_eq!(current.quorums, published_current.quorums);
         assert!(
-            cache.get_snapshot().await.is_err(),
-            "the detached first active result must never publish a snapshot"
+            cache.get_previous_quorums().await.is_err(),
+            "the detached first window must never publish a previous snapshot"
         );
-        assert!(cache.get_previous_quorums().await.is_err());
-        release_second.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        release_second
+            .send(())
+            .expect("the second active response must still be gated");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !second.is_finished() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -337,7 +349,8 @@ mod tests {
             tokio::task::yield_now().await;
         }
         second.await.unwrap().unwrap();
-        assert_eq!(cache.get_snapshot().await.unwrap().height, 101);
+        assert!(cache.get_snapshot().await.unwrap().refreshed > published_current.refreshed);
+        assert_eq!(cache.get_previous_quorums().await.unwrap().0, 52);
     }
 
     async fn finish_poll(cache: &QuorumCache, expected_polls: usize) {
