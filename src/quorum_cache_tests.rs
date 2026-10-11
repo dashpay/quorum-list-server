@@ -32,6 +32,7 @@ pub struct CoreState {
     pub omit_only: Option<u32>,
     pub historical_response_gate: Option<(u32, std::sync::mpsc::Receiver<()>)>,
     pub fail_block_count_at: Option<usize>,
+    pub creation_heights: std::collections::HashMap<u32, u32>,
 }
 
 pub struct MockCore {
@@ -69,6 +70,7 @@ impl MockCore {
             omit_only: None,
             historical_response_gate: None,
             fail_block_count_at: None,
+            creation_heights: std::collections::HashMap::new(),
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -156,7 +158,7 @@ impl MockCore {
                     } else {
                         let entries: Vec<Value> = state.quorums.iter()
                             .filter(|q| !state.empty && (state.omit_at_height != Some(height) || state.omit_only.is_some_and(|id| id != q.id)) && q.created <= height && height < q.retired)
-                            .map(|q| json!({hash(q.id): {"creationHeight":q.created, "numValidMembers":12, "minedBlockHash":hash(q.id + 100000 + state.commitments.get(&q.id).copied().unwrap_or(0))}}))
+                            .map(|q| json!({hash(q.id): {"creationHeight":state.creation_heights.get(&q.id).copied().unwrap_or(q.created), "numValidMembers":12, "minedBlockHash":hash(q.id + 100000 + state.commitments.get(&q.id).copied().unwrap_or(0))}}))
                             .collect();
                         json!({"llmq_devnet_platform": entries})
                     }
@@ -906,6 +908,39 @@ async fn should_reject_a_historical_sample_missing_an_older_active_quorum() {
         assert!(cache.refresh().await.is_err());
         assert_eq!(cache.get_previous_quorums().await.unwrap(), before);
     }
+}
+
+/// Newer history must prove completeness after tip-active quorums cease to constrain samples.
+#[tokio::test]
+async fn should_reject_a_missing_deep_sample_proven_by_newer_history() {
+    let mining_heights = [858, 882, 898, 922, 946, 970, 994];
+    let quorums = mining_heights
+        .iter()
+        .enumerate()
+        .map(|(id, &created)| Quorum {
+            id: id as u32,
+            created,
+            retired: mining_heights.get(id + 4).copied().unwrap_or(u32::MAX),
+        })
+        .collect();
+    let mut core = MockCore::new(1000, quorums);
+    core.config.quorum.retention_blocks = 144;
+    core.config.quorum.sample_step_blocks = Some(48);
+    core.state.lock().unwrap().creation_heights = (0..7).map(|id| (id, 840 + id * 24)).collect();
+    let cache = QuorumCache::new(core.config.clone());
+    cache.refresh().await.unwrap();
+    let before = cache.get_previous_quorums().await.unwrap();
+    assert!(
+        before.1.contains_quorum(&hex::decode(hash(0)).unwrap()),
+        "the quorum mined at 858 and retired at 946 appears only at the 904 sample"
+    );
+    core.state.lock().unwrap().omit_at_height = Some(904);
+    let error = cache
+        .refresh()
+        .await
+        .expect_err("a quorum created at 864 and observed at 952 must exist at 904");
+    assert!(error.to_string().contains("must still be active"));
+    assert_eq!(cache.get_previous_quorums().await.unwrap(), before);
 }
 
 /// Readiness gives load balancers a failing status without changing health's HTTP status.

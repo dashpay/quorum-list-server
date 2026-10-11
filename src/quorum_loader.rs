@@ -190,7 +190,8 @@ fn load_window(
         height = height.saturating_sub(step).max(floor);
         match load_at_height(client, config, height, memo, deadline, true) {
             Ok(list) => {
-                for entry in active.iter() {
+                // A quorum observed later was already active after its latest mining height.
+                for entry in active.iter().chain(window.iter()) {
                     if u64::from(entry.height) + 18 <= u64::from(height)
                         && !list.contains_quorum(&entry.quorum_hash)
                     {
