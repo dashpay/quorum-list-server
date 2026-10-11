@@ -1,13 +1,13 @@
 # Quorum List Server
 
-A Rust-based HTTP API server that provides RESTful endpoints for managing Dash LLMQ_25_67 quorum lists via RPC calls to Dash Core.
+A Rust-based HTTP API server providing the configured network's Platform quorum lists via RPC calls to Dash Core.
 
 ## Features
 
-- RPC-based quorum loading from Dash Core (LLMQ_25_67 quorums for testnet)
+- RPC-based Platform quorum loading for mainnet, testnet, devnet and regtest
 - RESTful API for quorum list management
-- TOML-based configuration with environment variable fallbacks
-- Previous quorum state lookup (configurable block offset)
+- TOML-based configuration with environment variable overrides
+- Stateless rolling window of active and recently retired quorums
 - Thread-safe shared state
 - Cross-platform support (Linux/Windows)
 - Graceful shutdown handling
@@ -15,13 +15,88 @@ A Rust-based HTTP API server that provides RESTful endpoints for managing Dash L
 ## API Endpoints
 
 ### Health Check
-- `GET /health` - Server health status
+- `GET /health` - Quorum cache freshness status (HTTP 200, inspect the JSON body)
+- `GET /ready` - Readiness status (HTTP 503 while degraded, 200 when fresh)
 
 ### Quorum Management
 - `GET /quorums` - Get all current quorums
 - `GET /quorums/stats` - Get quorum statistics 
 - `GET /quorums/{hash}` - Get specific quorum by hash
-- `GET /previous` - Get quorums from previous blocks (configurable offset)
+- `GET /previous` - Get the union of Platform quorums active in the retention window
+
+### Quorum retention and freshness
+
+`/quorums` keeps its existing `data` array and adds top-level `height` and
+`lastUpdated`. These describe the Core height sampled and the Unix timestamp in
+seconds of the successful refresh. Repeated reads and failed active-list refreshes
+do not advance them. Entries are ordered oldest to newest.
+
+`/previous` keeps `{ "success": true, "data": { "height": ..., "quorums": [...] } }`.
+Its list is rebuilt from Core on every refresh by taking the union of
+`quorum listextended` at the tip, then descending by the configured sample step,
+including the lower boundary `max(0, tip - R)`. Here
+`R = max(retention_blocks, previous_blocks_offset)`: existing offset settings
+retain at least their old coverage. `data.height` is now the lowest sampled
+height. No membership history is persisted, so a restart reconstructs the same
+window and a refresh removes orphaned quorums after a reorg.
+
+The Core 24 rc.3 Platform parameters are:
+
+| Network | LLMQ type | Active count A | DKG interval D | Default step |
+| --- | --- | --- | --- | --- |
+| mainnet | 4 (`llmq_100_67`) | 24 | 24 | 288 |
+| testnet | 6 (`llmq_25_67`) | 24 | 24 | 288 |
+| devnet | 107 (`llmq_devnet_platform`) | 4 | 24 | 48 |
+| regtest | 106 (`llmq_test_platform`) | 2 | 24 | 24 |
+
+Quorums become active when their commitments are mined. Core allows mining
+offsets 10 through 18 within a DKG cycle, so a run can be as short as `A*D - 8`
+blocks. Sampling every `A*D` blocks could miss a quorum. The conservative maximum
+step is `(A-1)*D + 1`, allowing any mining offset within a cycle. The default is
+`max(1, min(A*D/2, (A-1)*D+1))`. Failed DKGs lengthen active runs. Parameter
+overrides must match the connected Core; unsafe steps, zero intervals and zero
+cache limits are rejected at startup with an error. The output cap must exceed A,
+the key memo must hold at least the output cap, and a window may use at most
+256 samples (including both boundaries) to limit work within the refresh budget. See Core's
+[parameter table](https://github.com/dashpay/dash/blob/v24.0.0-rc.3/src/llmq/params.h)
+and [mined commitment scan](https://github.com/dashpay/dash/blob/v24.0.0-rc.3/src/llmq/quorumsman.cpp#L243-L244).
+
+The rolling list is ordered oldest to newest, with a default cap of 90 to fit
+clients' 100-entry caches. Overflow removes the oldest retired quorums first;
+active quorums are always retained, even if their count alone exceeds the cap.
+Trimming sacrifices coverage at the old end of the window. Size the retention
+and cap together. The 48-block default is suitable for 150-second blocks;
+accelerated 10-second devnets typically need 360–720 blocks to cover Core/Platform
+lag, a Platform block interval, the client's 31-minute metadata tolerance and
+clock skew.
+
+A bounded public-key memo keyed by `(quorumHash, minedBlockHash)` avoids repeat
+`quorum info` calls for unchanged commitments. A reorg can replace a commitment
+and its public key for the same quorum hash; the new mined block forces a refetch.
+All such calls explicitly use `includeSkShare=false`. Membership is recomputed,
+not taken from the memo. All quorum RPC runs on a serialized blocking worker;
+requests only read cached data. RPC sockets have a five-second timeout, refreshes
+have a 30-second deadline, and a timed-out worker retains its permit until it
+finishes, preventing accumulating background workers.
+
+The service polls `getblockcount` once per second and reloads when the height
+changes. The cache TTL bounds reloads even at an unchanged height (including
+same-height reorgs), and a poll interval longer than the TTL is reduced to the
+TTL. Both lists are attempted independently and keep their last good data on
+failure. An empty active list or invalid quorum/key data is a failed refresh,
+never an empty success. Historical samples must contain every tip-active quorum
+whose creation height plus the mining-window end (18 blocks) precedes the sample;
+a short or empty result missing such a quorum fails the window refresh. A moving
+tip preserves the current list tied to its sampled height and retries the window
+once at the new tip. Repeated failed window reloads back off up to the smaller of
+30 seconds and the TTL; a newly observed tip bypasses this backoff.
+
+`/health` still returns HTTP 200 and the same JSON shape;
+it returns `success:false`, `data:null` and a degraded message when either list
+has never loaded or its last successful refresh is older than
+`cache_ttl_seconds * health_stale_intervals` (three intervals by default). `/ready`
+returns the same body with HTTP 503 while degraded and HTTP 200 when fresh, so
+load balancers can use it without changing existing `/health` matchers.
 
 ### Masternode bootstrap metadata
 
@@ -67,6 +142,8 @@ validate the node ID and endpoint fields. Existing clients can continue reading
 
 ### config.toml
 ```toml
+network = "testnet"
+
 [server]
 port = 3000
 host = "0.0.0.0"
@@ -78,15 +155,41 @@ password = "password"
 
 [quorum]
 previous_blocks_offset = 8
+retention_blocks = 48
+cache_ttl_seconds = 60
+poll_interval_seconds = 1
+max_entries = 90
+key_memo_max_entries = 180
+health_stale_intervals = 3
+# sample_step_blocks = 288
+# active_quorum_count = 24
+# dkg_interval = 24
 ```
 
-### Environment Variables (fallbacks)
+### Environment Variables (overrides)
 - `API_HOST` - Server host (default: 0.0.0.0)
 - `API_PORT` - HTTP server port (default: 3000)
 - `DASH_RPC_URL` - RPC endpoint (default: http://127.0.0.1:19998)
 - `DASH_RPC_USER` - RPC username (default: dashrpc)
 - `DASH_RPC_PASSWORD` - RPC password (default: password)
-- `QUORUM_PREVIOUS_BLOCKS_OFFSET` - Previous blocks offset (default: 8)
+- `DASH_NETWORK` - mainnet, testnet, devnet or regtest (default: testnet)
+
+| TOML `[quorum]` key | Environment override | Default |
+| --- | --- | --- |
+| `previous_blocks_offset` | `QUORUM_PREVIOUS_BLOCKS_OFFSET` | 8; lower bound on retention |
+| `retention_blocks` | `QUORUM_RETENTION_BLOCKS` | 48 |
+| `cache_ttl_seconds` | `QUORUM_CACHE_TTL_SECONDS` | 60; local dashmate networks can use 1 |
+| `sample_step_blocks` | `QUORUM_SAMPLE_STEP_BLOCKS` | Derived from A and D as above |
+| `active_quorum_count` | `QUORUM_ACTIVE_QUORUM_COUNT` | Network table above |
+| `dkg_interval` | `QUORUM_DKG_INTERVAL` | 24 blocks |
+| `max_entries` | `QUORUM_MAX_ENTRIES` | 90; active entries are never trimmed |
+| `key_memo_max_entries` | `QUORUM_KEY_MEMO_MAX_ENTRIES` | 180 public keys |
+| `poll_interval_seconds` | `QUORUM_POLL_INTERVAL_SECONDS` | 1 |
+| `health_stale_intervals` | `QUORUM_HEALTH_STALE_INTERVALS` | 3 |
+
+Environment variables override TOML values. When the file cannot be loaded,
+environment variables override the built-in defaults. Older TOML files
+with only `previous_blocks_offset` continue to work with the new defaults.
 
 ## Usage
 
@@ -124,7 +227,9 @@ docker run --rm -p 8080:8080 \
   quorum-list-server
 ```
 
-The server reads `/app/config.toml` first; environment variables are only used when that file is absent.
+The server reads `/app/config.toml` first, then applies environment overrides.
+The image does not set `API_HOST` or `API_PORT`; the binary defaults to `0.0.0.0:3000`
+when neither the file nor explicitly supplied environment variables configure them.
 
 ## API Examples
 
@@ -138,7 +243,7 @@ curl http://localhost:3000/quorums
 # Get quorum stats
 curl http://localhost:3000/quorums/stats
 
-# Get previous quorums (8 blocks ago by default)
+# Get active and recently retired quorums (48-block window by default)
 curl http://localhost:3000/previous
 
 # Get specific quorum by hash
@@ -180,9 +285,9 @@ Example quorum response:
 ## Architecture
 
 - **RPC Integration**: Uses `dashcore-rpc` to communicate with Dash Core
-- **LLMQ Type**: Only processes LLMQ_25_67 (type 6) quorums for testnet
-- **Configuration**: TOML-first with environment variable fallbacks
-- **State Management**: Thread-safe Arc<RwLock<QuorumList>> for shared state
+- **LLMQ Type**: Processes the configured network's Platform quorum type
+- **Configuration**: TOML values with environment variable overrides
+- **State Management**: Cached lists and freshness metadata published under one lock
 - **API Framework**: Built with Axum for async HTTP handling
 
 ## Development

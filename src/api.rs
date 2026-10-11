@@ -26,6 +26,8 @@ pub struct ApiResponse<T> {
     pub message: Option<String>,
     #[serde(rename = "lastUpdated", skip_serializing_if = "Option::is_none")]
     pub last_updated: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl<T> ApiResponse<T> {
@@ -35,6 +37,7 @@ impl<T> ApiResponse<T> {
             data: Some(data),
             message: None,
             last_updated: None,
+            height: None,
         }
     }
 
@@ -44,6 +47,7 @@ impl<T> ApiResponse<T> {
             data: None,
             message: Some(message),
             last_updated: None,
+            height: None,
         }
     }
 }
@@ -110,6 +114,7 @@ pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode
     let shared_config = Arc::new(config);
     Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
         .route("/quorums", get(get_all_quorums))
         .route("/quorums/stats", get(get_quorum_stats))
         .route("/previous", get(get_previous_quorums))
@@ -122,19 +127,48 @@ pub fn create_router(quorum_cache: SharedQuorumCache, config: Config, masternode
         .layer(CompressionLayer::new())
 }
 
-async fn health_check() -> Json<ApiResponse<String>> {
-    Json(ApiResponse::success("Quorum List Server is running".to_string()))
+async fn health_check(
+    State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
+) -> Json<ApiResponse<String>> {
+    if quorum_cache.is_healthy().await {
+        Json(ApiResponse::success(
+            "Quorum List Server is running".to_string(),
+        ))
+    } else {
+        Json(ApiResponse::error(
+            "Quorum List Server is degraded: quorum refresh is stale or unavailable".to_string(),
+        ))
+    }
+}
+
+async fn readiness_check(
+    state: State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
+) -> (StatusCode, Json<ApiResponse<String>>) {
+    let response = health_check(state).await;
+    let status = if response.0.success {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, response)
 }
 
 async fn get_all_quorums(
     State((quorum_cache, _, _)): State<(SharedQuorumCache, SharedConfig, SharedMasternodeCache)>,
 ) -> Result<Json<ApiResponse<Vec<QuorumEntryResponse>>>, StatusCode> {
-    match quorum_cache.get_quorums().await {
-        Ok(quorums) => {
-            let quorums: Vec<QuorumEntryResponse> = quorums.iter().map(|entry| entry.into()).collect();
-            Ok(Json(ApiResponse::success(quorums)))
+    match quorum_cache.get_snapshot().await {
+        Ok(snapshot) => {
+            let quorums: Vec<QuorumEntryResponse> =
+                snapshot.quorums.iter().map(|entry| entry.into()).collect();
+            let mut response = ApiResponse::success(quorums);
+            response.height = Some(snapshot.height);
+            response.last_updated = Some(snapshot.last_updated);
+            Ok(Json(response))
         }
-        Err(e) => Ok(Json(ApiResponse::error(format!("Failed to load quorums: {}", e))))
+        Err(e) => Ok(Json(ApiResponse::error(format!(
+            "Failed to load quorums: {}",
+            e
+        )))),
     }
 }
 
