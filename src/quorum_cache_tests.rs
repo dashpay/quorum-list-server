@@ -30,6 +30,8 @@ pub struct CoreState {
     pub tip_script: std::collections::VecDeque<u32>,
     pub first_response_gate: Option<std::sync::mpsc::Receiver<()>>,
     pub omit_only: Option<u32>,
+    pub historical_response_gate: Option<(u32, std::sync::mpsc::Receiver<()>)>,
+    pub fail_block_count_at: Option<usize>,
 }
 
 pub struct MockCore {
@@ -65,6 +67,8 @@ impl MockCore {
             tip_script: std::collections::VecDeque::new(),
             first_response_gate: None,
             omit_only: None,
+            historical_response_gate: None,
+            fail_block_count_at: None,
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_state = state.clone();
@@ -128,6 +132,15 @@ impl MockCore {
                 }
                 let failed = state.fail
                     || fail_once
+                    || (request["method"] == "getblockcount"
+                        && state.fail_block_count_at
+                            == Some(
+                                state
+                                    .calls
+                                    .iter()
+                                    .filter(|call| call["method"] == "getblockcount")
+                                    .count(),
+                            ))
                     || (is_list && state.fail_height == Some(height))
                     || (state.fail_current && is_list && height == state.tip);
                 let result = if request["method"] == "getblockcount" {
@@ -159,7 +172,16 @@ impl MockCore {
                     json!({"result":result, "error":null, "id":request["id"]})
                 }.to_string();
                 let delay = state.delay;
-                let gate = state.first_response_gate.take();
+                let gate = if is_list
+                    && state
+                        .historical_response_gate
+                        .as_ref()
+                        .is_some_and(|(gated_height, _)| *gated_height == height)
+                {
+                    state.historical_response_gate.take().map(|(_, gate)| gate)
+                } else {
+                    state.first_response_gate.take()
+                };
                 drop(state);
                 if let Some(gate) = gate {
                     let _ = gate.recv_timeout(Duration::from_secs(5));
@@ -534,6 +556,105 @@ async fn should_keep_the_window_when_a_historical_sample_fails() {
         before,
         endpoint(cache, core.config.clone(), "/previous").await
     );
+}
+
+/// New active signing keys must survive a timed-out historical refresh.
+#[tokio::test]
+async fn should_publish_current_when_the_window_times_out() {
+    let core = jameson();
+    let cache = Arc::new(QuorumCache::new(core.config.clone()));
+    cache.refresh().await.unwrap();
+    let previous = cache.get_previous_quorums().await.unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    {
+        let mut state = core.state.lock().unwrap();
+        state.tip += 1;
+        let created = state.tip;
+        state.quorums.push(Quorum {
+            id: 6,
+            created,
+            retired: u32::MAX,
+        });
+        state.historical_response_gate = Some((13224, gate));
+        state.calls.clear();
+    }
+    let refreshing = cache.clone();
+    let refresh = tokio::spawn(async move { refreshing.refresh().await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !core
+        .state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .any(|call| call["params"][0] == "listextended" && call["params"][1] == 13224)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "historical request did not start"
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let result = refresh.await.unwrap();
+    release.send(()).unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    let current = endpoint(cache.clone(), core.config.clone(), "/quorums").await;
+    assert_eq!(current["success"], true);
+    assert!(
+        current["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["quorum_hash"] == hash(6)),
+        "successful active keys must survive the window timeout"
+    );
+    assert_eq!(cache.get_snapshot().await.unwrap().height, 13272);
+    assert_eq!(cache.get_previous_quorums().await.unwrap(), previous);
+    assert!(!cache.is_healthy().await);
+}
+
+/// Late verification errors must preserve history without discarding new signing keys.
+#[tokio::test]
+async fn should_publish_current_when_the_final_tip_verification_fails() {
+    for failing_call in [2, 3] {
+        let core = jameson();
+        let cache = Arc::new(QuorumCache::new(core.config.clone()));
+        cache.refresh().await.unwrap();
+        let previous = cache.get_previous_quorums().await.unwrap();
+        {
+            let mut state = core.state.lock().unwrap();
+            state.tip += 1;
+            let created = state.tip;
+            state.quorums.push(Quorum {
+                id: 6,
+                created,
+                retired: u32::MAX,
+            });
+            state.calls.clear();
+            state.fail_block_count_at = Some(failing_call);
+            if failing_call == 3 {
+                state.tip_script = [13272, 13273, 13273].into();
+            }
+        }
+        assert!(cache.refresh().await.is_err());
+        let current = endpoint(cache.clone(), core.config.clone(), "/quorums").await;
+        assert!(
+            current["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["quorum_hash"] == hash(6)),
+            "successful active keys must survive a late getblockcount failure"
+        );
+        assert_eq!(cache.get_snapshot().await.unwrap().height, 13272);
+        assert_eq!(cache.get_previous_quorums().await.unwrap(), previous);
+        assert!(!cache.is_healthy().await);
+        core.state.lock().unwrap().fail_block_count_at = None;
+        cache.refresh().await.unwrap();
+        assert!(cache.is_healthy().await);
+    }
 }
 
 /// An active-list failure must not skip the independently recoverable rolling window.

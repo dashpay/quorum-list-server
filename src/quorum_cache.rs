@@ -17,6 +17,7 @@ pub struct QuorumSnapshot {
 struct CacheState {
     current: Option<QuorumSnapshot>,
     previous: Option<QuorumSnapshot>,
+    previous_failed: bool,
 }
 
 pub struct QuorumCache {
@@ -88,46 +89,62 @@ impl QuorumCache {
         .map_err(|_| "Quorum RPC worker timed out")?
     }
 
-    /// Both lists are attempted; failures preserve each list's last good snapshot.
-    pub async fn refresh(&self) -> LoadResult<()> {
+    async fn quorum_work<T, F>(&self, work: F) -> LoadResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Config, &mut KeyMemo) -> LoadResult<T> + Send + 'static,
+    {
         let config = self.config.clone();
         let memo = self.memo.clone();
-        let result = self
-            .rpc_work(move || {
-                let mut memo = memo.lock().unwrap_or_else(|poisoned| {
-                    memo.clear_poison();
-                    let mut memo = poisoned.into_inner();
-                    *memo = KeyMemo::default();
-                    memo
-                });
-                quorum_loader::refresh(&config, &mut memo)
-            })
-            .await?;
-        let now = Instant::now();
-        let last_updated = chrono::Utc::now().timestamp();
+        self.rpc_work(move || {
+            let mut memo = memo.lock().unwrap_or_else(|poisoned| {
+                memo.clear_poison();
+                let mut memo = poisoned.into_inner();
+                *memo = KeyMemo::default();
+                memo
+            });
+            work(&config, &mut memo)
+        })
+        .await
+    }
+
+    /// Publish active keys before spending the window's separate RPC budget on history.
+    pub async fn refresh(&self) -> LoadResult<()> {
+        let current = self.quorum_work(quorum_loader::refresh_current).await;
+        let current_error = match &current {
+            Ok(result) => match &result.current {
+                Ok(quorums) => {
+                    let mut state = self
+                        .state
+                        .write()
+                        .map_err(|_| "Failed to write quorum cache")?;
+                    state.current = Some(QuorumSnapshot {
+                        quorums: quorums.clone(),
+                        height: result.tip,
+                        last_updated: chrono::Utc::now().timestamp(),
+                        refreshed: Instant::now(),
+                    });
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            },
+            Err(error) => Some(error.to_string()),
+        };
+        let previous = self
+            .quorum_work(move |config, memo| quorum_loader::refresh_previous(config, memo, current))
+            .await;
         let mut state = self
             .state
             .write()
             .map_err(|_| "Failed to write quorum cache")?;
-        let current_error = match result.current {
-            Ok(quorums) => {
-                state.current = Some(QuorumSnapshot {
-                    quorums,
-                    height: result.tip,
-                    last_updated,
-                    refreshed: now,
-                });
-                None
-            }
-            Err(error) => Some(error),
-        };
-        let previous_error = match result.previous {
+        state.previous_failed = previous.is_err();
+        let previous_error = match previous {
             Ok((height, quorums)) => {
                 state.previous = Some(QuorumSnapshot {
                     quorums,
                     height,
-                    last_updated,
-                    refreshed: now,
+                    last_updated: chrono::Utc::now().timestamp(),
+                    refreshed: Instant::now(),
                 });
                 None
             }
@@ -135,7 +152,8 @@ impl QuorumCache {
         };
         match (current_error, previous_error) {
             (None, None) => Ok(()),
-            (Some(error), None) | (None, Some(error)) => Err(error),
+            (Some(error), None) => Err(error.into()),
+            (None, Some(error)) => Err(error),
             (Some(current), Some(previous)) => {
                 Err(format!("Current quorums: {current}; rolling window: {previous}").into())
             }
@@ -151,7 +169,8 @@ impl QuorumCache {
         };
         match (&state.current, &state.previous) {
             (Some(current), Some(previous)) => {
-                current.refreshed.elapsed() < stale_after
+                !state.previous_failed
+                    && current.refreshed.elapsed() < stale_after
                     && previous.refreshed.elapsed() < stale_after
             }
             _ => false,

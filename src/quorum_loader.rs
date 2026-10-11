@@ -33,10 +33,9 @@ impl KeyMemo {
     }
 }
 
-pub struct RefreshResult {
+pub struct CurrentResult {
     pub tip: u32,
     pub current: LoadResult<QuorumList>,
-    pub previous: LoadResult<(u32, QuorumList)>,
 }
 
 fn client(config: &Config) -> LoadResult<Client> {
@@ -232,7 +231,7 @@ fn load_window(
 }
 
 /// Blocking RPC work; callers must run this on a blocking worker.
-pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult> {
+pub fn refresh_current(config: &Config, memo: &mut KeyMemo) -> LoadResult<CurrentResult> {
     let deadline = Instant::now() + REFRESH_TIMEOUT;
     let client = client(config)?;
     let tip = block_height(&client)?;
@@ -243,6 +242,24 @@ pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult>
             Ok(list)
         }
     });
+    Ok(CurrentResult { tip, current })
+}
+
+/// Window failures, including tip verification, are independent of active publication.
+pub fn refresh_previous(
+    config: &Config,
+    memo: &mut KeyMemo,
+    current: LoadResult<CurrentResult>,
+) -> LoadResult<(u32, QuorumList)> {
+    let deadline = Instant::now() + REFRESH_TIMEOUT;
+    let client = client(config)?;
+    let CurrentResult { tip, current } = match current {
+        Ok(result) => result,
+        Err(error) => CurrentResult {
+            tip: block_height(&client)?,
+            current: Err(error),
+        },
+    };
     let mut previous = load_window(&client, config, tip, &current, memo, deadline);
     let next_tip = block_height(&client)?;
     if next_tip != tip {
@@ -252,11 +269,7 @@ pub fn refresh(config: &Config, memo: &mut KeyMemo) -> LoadResult<RefreshResult>
             previous = Err("Core tip changed again while retrying the rolling window".into());
         }
     }
-    Ok(RefreshResult {
-        tip,
-        current,
-        previous,
-    })
+    previous
 }
 
 #[cfg(test)]
